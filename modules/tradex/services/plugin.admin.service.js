@@ -1,5 +1,5 @@
 import TradingSession from "../../../models/tradingSession.js";
-import { forwardToPlugin } from "./plugin.proxy.service.js";
+import { forwardToPlugin, resolvePluginTargetUrl } from "./plugin.proxy.service.js";
 import logger from "../config/logger.js";
 
 /**
@@ -11,7 +11,7 @@ const adminStopSession = async (userId, sessionId) => {
     logger.info("[Admin] Stopping session", { userId, sessionId });
 
     const ts_lookup = await TradingSession.findOne({ python_session_id: sessionId });
-    const targetBaseUrl = ts_lookup?.vm_url;
+    const targetBaseUrl = resolvePluginTargetUrl(ts_lookup);
 
     const pluginRes = await forwardToPlugin(
         `/api/admin/sessions/${sessionId}/stop`,

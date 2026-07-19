@@ -1,19 +1,20 @@
 import { Readable } from "stream";
 import logger from "../config/logger.js";
+import AppError from "../utils/AppError.js";
 
-const PLUGIN_BASE = process.env.PLUGIN_BASE_URL || (process.env.NODE_ENV === 'production' ? 'https://plugin.mintzy.in' : 'https://plugin.mintzy.in');
-const PLUGIN_API_KEY = process.env.PLUGIN_API_KEY || 'changeme-plugin-api-key';
+const PLUGIN_BASE = process.env.ANGLE_ONE_PLUGIN_BASE_URL || process.env.PLUGIN_BASE_URL || "https://plugin.mintzy.in";
+const PLUGIN_API_KEY = process.env.PLUGIN_API_KEY || "changeme-plugin-api-key";
 
 const API_KEY_VM_MAP = {
-    '91IIRlrP': 'http://34.206.145.136:8000',
-    '91IIRIrP': 'http://34.206.145.136:8000',
-    '2pKOv1sa': 'http://44.208.177.169',
-    'eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3htbGRzaWctbW9yZSNobWFjLXNoYTI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOiIxNzgyMzgzNjE5IiwiaXNzIjoibUFyS2V0SHVCIiwiZXhwIjoiMTgxMzc5NTIwMCIsImF1ZCI6IkhPOTk5OSIsImp0aSI6IjIwNyIsImZsZyI6IjY0In0.ueDks3vA9Jn8D1zBQwnnOlLoC9jQtsMIcXjPeNGwM0Q': 'http://32.198.166.49:8000'
+    "91IIRlrP": "http://34.206.145.136:8000",
+    "91IIRIrP": "http://34.206.145.136:8000",
+    "2pKOv1sa": "http://44.208.177.169",
+    "eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3htbGRzaWctbW9yZSNobWFjLXNoYTI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOiIxNzgyMzgzNjE5IiwiaXNzIjoibUFyS2V0SHVCIiwiZXhwIjoiMTgxMzc5NTIwMCIsImF1ZCI6IkhPOTk5OSIsImp0aSI6IjIwNyIsImZsZyI6IjY0In0.ueDks3vA9Jn8D1zBQwnnOlLoC9jQtsMIcXjPeNGwM0Q": "http://32.198.166.49:8000"
 };
 
-const AUTO_AUTH_API_KEY_PREFIX = 'eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3htbGRzaWctbW9yZSNobWFjLXNoYTI1NiIsInR5cCI6IkpXVCJ9';
+const AUTO_AUTH_API_KEY_PREFIX = "eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3htbGRzaWctbW9yZSNobWFjLXNoYTI1NiIsInR5cCI6IkpXVCJ9";
 
-const normalizeApiKey = (apiKey) => String(apiKey || '').replace(/\s+/g, '');
+const normalizeApiKey = (apiKey) => String(apiKey || "").replace(/\s+/g, "");
 
 const shouldAutoAuthenticateApiKey = (apiKey) => {
     const normalizedApiKey = normalizeApiKey(apiKey);
@@ -21,9 +22,32 @@ const shouldAutoAuthenticateApiKey = (apiKey) => {
 };
 
 const getTargetBaseUrlByApiKey = (apiKey) => {
+    if (process.env.PLUGIN_FORCE_LOCAL === "true") {
+        return PLUGIN_BASE;
+    }
+
+    const useVmRouting = process.env.PLUGIN_USE_VM_ROUTING !== "false";
     const normalizedApiKey = normalizeApiKey(apiKey);
-    return API_KEY_VM_MAP[normalizedApiKey] || PLUGIN_BASE;
+
+    if (useVmRouting && API_KEY_VM_MAP[normalizedApiKey]) {
+        return API_KEY_VM_MAP[normalizedApiKey];
+    }
+
+    return PLUGIN_BASE;
 };
+
+const resolvePluginTargetUrl = (tradingSession) => tradingSession?.vm_url || PLUGIN_BASE;
+
+const getRoutingDebugInfo = (apiKey, tradingSession) => ({
+    pluginBase: PLUGIN_BASE,
+    pluginForceLocal: process.env.PLUGIN_FORCE_LOCAL === "true",
+    pluginUseVmRouting: process.env.PLUGIN_USE_VM_ROUTING !== "false",
+    apiKeyMapped: apiKey ? !!API_KEY_VM_MAP[normalizeApiKey(apiKey)] : null,
+    autoAuthKey: apiKey ? shouldAutoAuthenticateApiKey(apiKey) : null,
+    resolvedByApiKey: apiKey ? getTargetBaseUrlByApiKey(apiKey) : null,
+    storedVmUrl: tradingSession?.vm_url || null,
+    resolvedBySession: tradingSession ? resolvePluginTargetUrl(tradingSession) : null
+});
 
 const parseResponseBody = async (response) => {
     const text = await response.text();
@@ -37,28 +61,22 @@ const parseResponseBody = async (response) => {
     }
 };
 
-/**
- * Low-level utility to forward requests to the FastAPI plugin
- */
-async function forwardToPlugin(path, method = 'post', data = {}, headers = {}, params = {}, options = {}) {
+async function forwardToPlugin(path, method = "post", data = {}, headers = {}, params = {}, options = {}) {
     const base = options.targetBaseUrl || PLUGIN_BASE;
-    const url = base.replace(/\/$/, '') + path;
+    const url = base.replace(/\/$/, "") + path;
     const h = { ...headers };
 
-    console.log(`[Proxy] Forwarding ${method.toUpperCase()} request to exactly: ${url}`);
-    
-    if (PLUGIN_API_KEY && PLUGIN_API_KEY !== 'changeme-plugin-api-key') {
-        h['X-Plugin-Api-Key'] = PLUGIN_API_KEY;
+    if (PLUGIN_API_KEY && PLUGIN_API_KEY !== "changeme-plugin-api-key") {
+        h["X-Plugin-Api-Key"] = PLUGIN_API_KEY;
     }
 
-    const timeoutMs = options.timeoutMs || parseInt(process.env.PLUGIN_REQUEST_TIMEOUT || '60000', 10);
-    const maxRetries = (typeof options.retries === 'number') ? options.retries : parseInt(process.env.PLUGIN_REQUEST_RETRIES || '2', 10);
+    const timeoutMs = options.timeoutMs || parseInt(process.env.PLUGIN_REQUEST_TIMEOUT || "60000", 10);
+    const maxRetries = typeof options.retries === "number" ? options.retries : parseInt(process.env.PLUGIN_REQUEST_RETRIES || "2", 10);
     const failOnError = options.failOnError === undefined ? true : !!options.failOnError;
 
-    let lastErr = null;
-    for (let attempt = 1; attempt <= Math.max(1, maxRetries); attempt++) {
+    for (let attempt = 1; attempt <= Math.max(1, maxRetries); attempt += 1) {
         const start = Date.now();
-        console.log("url",url);
+
         try {
             const opts = {
                 method,
@@ -75,20 +93,12 @@ async function forwardToPlugin(path, method = 'post', data = {}, headers = {}, p
 
             const query = new URLSearchParams(params || {});
             const response = await fetch(query.size ? `${url}?${query.toString()}` : url, opts);
-            const duration = Date.now() - start;
-            const headers = Object.fromEntries(response.headers.entries());
-            const responseType = options.responseType || "json";
-            let responseData;
-
-            if (responseType === "stream") {
-                responseData = Readable.fromWeb(response.body);
-            } else {
-                responseData = await parseResponseBody(response);
-            }
-
+            const responseData = options.responseType === "stream"
+                ? Readable.fromWeb(response.body)
+                : await parseResponseBody(response);
             const normalizedResponse = {
                 status: response.status,
-                headers,
+                headers: Object.fromEntries(response.headers.entries()),
                 data: responseData
             };
 
@@ -98,52 +108,51 @@ async function forwardToPlugin(path, method = 'post', data = {}, headers = {}, p
                 throw error;
             }
 
-            logger.info(`[Proxy] ${method.toUpperCase()} ${path} success`, {
-                duration,
+            logger.info(`[AngleOne Proxy] ${method.toUpperCase()} ${path} success`, {
+                duration: Date.now() - start,
                 attempt,
                 status: normalizedResponse.status
             });
 
             return normalizedResponse;
         } catch (err) {
-            const duration = Date.now() - start;
-            lastErr = err;
-
-            logger.warn(`[Proxy] ${method.toUpperCase()} ${path} failed`, {
-                url,
-                duration,
-                attempt,
-                error: err.message,
-                code: err.code,
-                status: err.response?.status,
-                stack: err.stack
-            });
-
             const isClientError = err.response?.status >= 400 && err.response?.status < 500;
 
+            logger.warn(`[AngleOne Proxy] ${method.toUpperCase()} ${path} failed`, {
+                url,
+                duration: Date.now() - start,
+                attempt,
+                error: err.message,
+                status: err.response?.status,
+                details: err.response?.data
+            });
+
             if (attempt < maxRetries && !isClientError) {
-                const backoff = 200 * attempt;
-                await new Promise((r) => setTimeout(r, backoff));
+                await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
                 continue;
             }
 
             if (failOnError) {
-                const customErr = new Error(`Plugin request failed at ${path}: ${err.message}`);
-                customErr.status = err.response?.status || 502;
-                customErr.statusCode = customErr.status;
+                const statusCode = err.response?.status || 502;
+                const customErr = new AppError(`Plugin request failed at ${path}: ${err.message}`, statusCode);
                 customErr.response = err.response;
                 customErr.details = err.response?.data;
                 throw customErr;
             }
+
             return null;
         }
     }
+
+    return null;
 }
 
 export {
     forwardToPlugin,
     PLUGIN_BASE,
     getTargetBaseUrlByApiKey,
+    resolvePluginTargetUrl,
+    getRoutingDebugInfo,
     normalizeApiKey,
     shouldAutoAuthenticateApiKey
 };
@@ -152,6 +161,8 @@ export default {
     forwardToPlugin,
     PLUGIN_BASE,
     getTargetBaseUrlByApiKey,
+    resolvePluginTargetUrl,
+    getRoutingDebugInfo,
     normalizeApiKey,
     shouldAutoAuthenticateApiKey
 };
