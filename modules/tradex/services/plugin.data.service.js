@@ -1,6 +1,6 @@
 import mongoose from "mongoose";
 import "../../../models/tradingSession.js";
-import { forwardToPlugin } from "./plugin.proxy.service.js";
+import { forwardToPlugin, resolvePluginTargetUrl } from "./plugin.proxy.service.js";
 import logger from "../config/logger.js";
 
 const escapeCsvValue = (value) => {
@@ -15,12 +15,10 @@ const toCsv = (rows) => {
     if (!rows || rows.length === 0) return "";
 
     const fields = Object.keys(rows[0]);
-    const lines = [
+    return [
         fields.join(","),
         ...rows.map((row) => fields.map((field) => escapeCsvValue(row[field])).join(","))
-    ];
-
-    return lines.join("\n");
+    ].join("\n");
 };
 
 /**
@@ -573,6 +571,56 @@ const markPluginSessionAuthenticated = async (sessionId, metadata = {}) => {
     return session;
 };
 
+const markPluginSessionTradingActive = async (sessionId, metadata = {}) => {
+    const startedAt = new Date();
+    const db = getPluginDb();
+    const collection = db.collection("plugin_sessions");
+
+    const result = await collection.findOneAndUpdate(
+        { session_id: sessionId },
+        {
+            $set: {
+                status: "trading_active",
+                trading_status: metadata.trading_status || "running",
+                trading_started_at: startedAt,
+                updated_at: startedAt,
+                ...(metadata.strategy ? { strategy: metadata.strategy } : {}),
+                ...(metadata.symbols ? { symbols: metadata.symbols } : {}),
+                ...(metadata.time_frame ? { time_frame: metadata.time_frame } : {}),
+                ...(metadata.candle ? { candle: metadata.candle } : {}),
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    return result?.value || result;
+};
+
+const markPluginSessionStopped = async (sessionId, metadata = {}) => {
+    const stoppedAt = metadata.stopped_at ? new Date(metadata.stopped_at) : new Date();
+    const db = getPluginDb();
+    const collection = db.collection("plugin_sessions");
+
+    const result = await collection.findOneAndUpdate(
+        { session_id: sessionId },
+        {
+            $set: {
+                status: "stopped",
+                trading_status: metadata.trading_status || "stopped",
+                stopped: true,
+                ended_at: stoppedAt,
+                stopped_at: stoppedAt,
+                updated_at: stoppedAt,
+                worker_pid: null,
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    await syncStoppedPluginSessionToTradingSession(sessionId, result?.value || result);
+    return result?.value || result;
+};
+
 /**
  * Debug helper: mark a plugin DB session as stopped without touching the
  * trading engine. This is intentionally only for manual recovery/testing.
@@ -621,7 +669,7 @@ const getDashboardState = async (userId, sessionId) => {
     logger.info("Fetching dashboard state", { userId, sessionId });
 
     const ts = await mongoose.model('TradingSession').findOne({ python_session_id: sessionId });
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
 
     // 🕒 IST Market Hours Check for Snapshot
     const now = new Date();
@@ -697,7 +745,7 @@ const restoreSession = async (userId, token) => {
     // Without full python_session_id mapping to token easily, we fallback to user's latest session if possible, though token route might handle its own proxy locally.
     // For now we try to find active session for user to derive VM URL
     const ts = await mongoose.model('TradingSession').findOne({ user_id: userId }).sort({ created_at: -1 });
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
 
     return await forwardToPlugin(`/api/session/restore`, 'get', null, { 'X-Forwarded-User': userId.toString() }, { token }, { targetBaseUrl });
 };
@@ -709,7 +757,7 @@ const getFullSessionState = async (userId, pythonSessionId) => {
     logger.info("Fetching full session state", { userId, pythonSessionId });
 
     const ts = await mongoose.model('TradingSession').findOne({ python_session_id: pythonSessionId });
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
 
     const settled = await Promise.allSettled([
         forwardToPlugin(`/api/session/${pythonSessionId}/status`, 'get', null, { 'X-Forwarded-User': userId.toString() }, {}, { timeoutMs: 10000, retries: 2, failOnError: false, targetBaseUrl }),
@@ -744,7 +792,7 @@ const getFullSessionState = async (userId, pythonSessionId) => {
 const saveFinalPnlSnapshot = async (sessionId) => {
     try {
         const ts = await mongoose.model('TradingSession').findOne({ python_session_id: sessionId });
-        const targetBaseUrl = ts?.vm_url;
+        const targetBaseUrl = resolvePluginTargetUrl(ts);
         const userId = ts?.user_id?.toString();
 
         const result = await forwardToPlugin(
@@ -823,7 +871,7 @@ const getLivePnl = async (userId, sessionId) => {
         return { ready: false, stopped: true, status: ts.status, data: null };
     }
 
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
     const pluginResponse = await fetchLivePnlFromPlugin(userId, sessionId, targetBaseUrl);
 
     return pluginResponse;
@@ -871,7 +919,7 @@ const runLivePnlSnapshotTick = async (key) => {
             return;
         }
 
-        const pluginResponse = await fetchLivePnlFromPlugin(monitor.userId, monitor.sessionId, ts.vm_url);
+        const pluginResponse = await fetchLivePnlFromPlugin(monitor.userId, monitor.sessionId, resolvePluginTargetUrl(ts));
         await saveLivePnlSnapshot(monitor.userId, monitor.sessionId, pluginResponse);
     } catch (err) {
         logger.warn('Live PnL snapshot monitor tick failed', {
@@ -960,6 +1008,8 @@ export {
     fetchTradingLogs,
     fetchSessionStatus,
     markPluginSessionAuthenticated,
+    markPluginSessionTradingActive,
+    markPluginSessionStopped,
     debugStopPluginSession,
     getDashboardState,
     getTradingPnlSummary,
@@ -982,6 +1032,8 @@ export default {
     fetchTradingLogs,
     fetchSessionStatus,
     markPluginSessionAuthenticated,
+    markPluginSessionTradingActive,
+    markPluginSessionStopped,
     debugStopPluginSession,
     getDashboardState,
     getTradingPnlSummary,

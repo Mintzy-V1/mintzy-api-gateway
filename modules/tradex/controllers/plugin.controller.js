@@ -274,6 +274,13 @@ const abandonSession = catchAsync(async (req, res) => {
     if (!ts) throw new AppError("Session not found", 404);
     if (ts.status === "trading_active") throw new AppError("Active trading session cannot be abandoned", 400);
 
+    try {
+        // Also inform the python backend so it stops reporting 'authenticated' in snapshot
+        await tradingService.stopTrading(userId, sessionId);
+    } catch(err) {
+        logger.warn("Failed to stop trading on python backend during abandon", { error: err.message });
+    }
+
     ts.status = "abandoned";
     ts.ended_at = new Date();
     await ts.save();
@@ -445,7 +452,7 @@ const downloadFinalTradebook = catchAsync(async (req, res) => {
     const { sessionId } = req.params;
 
     const ts = await TradingSession.findOne({ python_session_id: sessionId });
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = proxyService.resolvePluginTargetUrl(ts);
 
     const pluginRes = await proxyService.forwardToPlugin(
         `/api/trading/${sessionId}/final-tradebook`,
@@ -589,6 +596,24 @@ const getHealth = catchAsync(async (req, res) => {
     });
 });
 
+/**
+ * @desc Debug plugin VM routing for a session or API key
+ */
+const getPluginRoutingDebug = catchAsync(async (req, res) => {
+    const { sessionId, apiKey } = req.query;
+    let tradingSession = null;
+
+    if (sessionId) {
+        tradingSession = await TradingSession.findOne({ python_session_id: sessionId }).lean();
+        if (!tradingSession) {
+            throw new AppError('Trading session not found', 404);
+        }
+    }
+
+    const routing = proxyService.getRoutingDebugInfo(apiKey || null, tradingSession);
+    res.status(200).json({ success: true, routing, tradingSession: tradingSession || null });
+});
+
 
 /**
  * @desc Get live P&L for a trading session
@@ -695,6 +720,7 @@ export {
     getAllSessions,
     getAllTradingLogs,
     getHealth,
+    getPluginRoutingDebug,
     stopSymbol,
     getLivePnl,
     getLivePnlHistory,
@@ -736,9 +762,11 @@ export default {
     getAllSessions,
     getAllTradingLogs,
     getHealth,
+    getPluginRoutingDebug,
     stopSymbol,
     getLivePnl,
     getLivePnlHistory,
     testFinalPnl,
     debugStopPluginSession
 };
+
