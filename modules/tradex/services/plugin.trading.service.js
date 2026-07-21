@@ -24,29 +24,51 @@ const checkMarketHours = () => {
 };
 
 const normalizeCredentialsPayload = (payload = {}) => {
+    console.log("\n--- normalizeCredentialsPayload INPUT ---");
+    console.log("Raw payload:", payload);
+    
     const userId = payload.userId;
     const access_key = payload.access_key || payload.accessKey;
     const access_secret = payload.access_secret || payload.accessSecret;
     const base_url = TRADEX_BASE_URL;
     const token = payload.token;
 
-    return {
+    const normalized = {
         userId,
         access_key,
         access_secret,
         base_url,
         token
     };
+    
+    console.log("Normalized credentials:", normalized);
+    console.log("--- normalizeCredentialsPayload OUTPUT ---\n");
+    
+    return normalized;
 };
 
 const submitCredentials = async (_jwtUserId, payload = {}) => {
+    console.log("\n\n========================================");
+    console.log("SERVICE: submitCredentials START");
+    console.log("========================================");
+    console.log("Parameter _jwtUserId:", _jwtUserId, "(type:", typeof _jwtUserId, ")");
+    console.log("Parameter payload:", payload);
+    
     const credentials = normalizeCredentialsPayload(payload);
     const { userId, access_key, access_secret, base_url, token } = credentials;
 
+    console.log("\nAfter normalization:");
+    console.log("  userId:", userId);
+    console.log("  access_key:", access_key);
+    console.log("  access_secret:", access_secret);
+    console.log("  token:", token);
+
     if (!userId || !access_key || !access_secret) {
+        console.log("\n❌ VALIDATION FAILED - Missing required fields");
         throw new AppError("userId, access_key, and access_secret are required", 400);
     }
-
+    
+    console.log("✅ Validation passed");
     logger.info("Submitting TradeX credentials", { userId });
 
     // if (!checkMarketHours()) {
@@ -54,7 +76,11 @@ const submitCredentials = async (_jwtUserId, payload = {}) => {
     // }
 
     const targetBaseUrl = getTargetBaseUrlByApiKey(access_key);
+    console.log("\ngetTargetBaseUrlByApiKey returned:", targetBaseUrl);
+    
     const autoAuthOnCredentials = shouldAutoAuthenticateApiKey(access_key);
+    console.log("shouldAutoAuthenticateApiKey returned:", autoAuthOnCredentials);
+    
     const pluginPayload = {
         broker_type: "tradex",
         api_key: access_key,
@@ -63,7 +89,9 @@ const submitCredentials = async (_jwtUserId, payload = {}) => {
         base_url,
         token
     };
+    console.log("\nPluginPayload to send:", pluginPayload);
 
+    console.log("\nCalling forwardToPlugin...");
     const pluginRes = await forwardToPlugin(
         "/api/auth/credentials",
         "post",
@@ -73,25 +101,37 @@ const submitCredentials = async (_jwtUserId, payload = {}) => {
         { targetBaseUrl }
     );
 
+    console.log("\nforwardToPlugin response:", pluginRes);
+    
     const pluginData = pluginRes.data || {};
+    console.log("pluginData extracted:", pluginData);
+    
     const pythonSessionId = pluginData.session_id;
+    console.log("pythonSessionId:", pythonSessionId, "(type:", typeof pythonSessionId, ")");
+    
     let initialPluginStatus = pluginData.status || "authenticated";
+    console.log("initialPluginStatus:", initialPluginStatus);
 
     if (pluginData.requires_totp === false) {
         initialPluginStatus = "authenticated";
         pluginData.status = "authenticated";
+        console.log("Updated initialPluginStatus (no TOTP required):", initialPluginStatus);
     }
 
     if (!pythonSessionId) {
+        console.log("\n❌ ERROR: pythonSessionId is missing");
         throw new AppError("Failed to create trading engine session", 502);
     }
+    
+    console.log("✅ pythonSessionId received successfully");
 
     const fingerprint = crypto
         .createHash("sha256")
         .update(`${access_key}:${userId}`)
         .digest("hex");
+    console.log("\nGenerated fingerprint:", fingerprint);
 
-    const ts = await TradingSession.create({
+    const sessionData = {
         user_id: userId,
         python_session_id: pythonSessionId,
         status: autoAuthOnCredentials && initialPluginStatus === "credentials_received"
@@ -100,20 +140,50 @@ const submitCredentials = async (_jwtUserId, payload = {}) => {
         credentials_fingerprint: fingerprint,
         vm_url: targetBaseUrl,
         auto_auth_on_credentials: autoAuthOnCredentials
+    };
+    
+    console.log("\n🔐 DATA BEING SAVED TO TRADINGSESSION:");
+    console.log("  user_id:", sessionData.user_id, "(type:", typeof sessionData.user_id, ")");
+    console.log("  python_session_id:", sessionData.python_session_id);
+    console.log("  status:", sessionData.status);
+    console.log("  credentials_fingerprint:", sessionData.credentials_fingerprint);
+    console.log("  vm_url:", sessionData.vm_url);
+    console.log("  auto_auth_on_credentials:", sessionData.auto_auth_on_credentials);
+    
+    console.log("\nAttempting TradingSession.create()...");
+    const ts = await TradingSession.create({
+        user_id: _jwtUserId,
+        python_session_id: pythonSessionId,
+        status: sessionData.status,
+        credentials_fingerprint: fingerprint,
+        vm_url: targetBaseUrl,
+        auto_auth_on_credentials: autoAuthOnCredentials
     });
 
+    console.log("✅ TradingSession created successfully:", ts._id);
+    
     if (autoAuthOnCredentials && initialPluginStatus === "credentials_received") {
+        console.log("\nMarking plugin session as authenticated...");
         await dataService.markPluginSessionAuthenticated(pythonSessionId, {
             reason: "special_access_key_credentials_received"
         });
         pluginData.status = "authenticated";
+        console.log("✅ Plugin session marked authenticated");
     }
 
-    return {
+    const response = {
         ...pluginData,
         node_session_id: ts._id,
         ts
     };
+    
+    console.log("\nReturning response from SERVICE:");
+    console.log(response);
+    console.log("========================================");
+    console.log("SERVICE: submitCredentials END");
+    console.log("========================================\n\n");
+    
+    return response;
 };
 
 const verifyTotp = async (userId, payload = {}) => {

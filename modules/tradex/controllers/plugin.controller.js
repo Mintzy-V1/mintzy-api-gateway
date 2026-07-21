@@ -192,9 +192,24 @@ const getSessionById = catchAsync(async (req, res) => {
  * @desc Submit broker credentials
  */
 const submitCredentials = catchAsync(async (req, res) => {
-    console.log("inside the submit credentials controllers")
+    console.log("\n=== CONTROLLER: submitCredentials START ===");
+    console.log("Request headers:", req.headers);
+    console.log("Request body:", req.body);
+    console.log("Request user:", req.user);
+    
     const userId = getRequestUserId(req);
+    console.log("Extracted userId from getRequestUserId():", userId);
+    console.log("UserId type:", typeof userId);
+    
+    console.log("\nCalling tradingService.submitCredentials with:");
+    console.log("  userId:", userId);
+    console.log("  payload:", req.body);
+    
     const result = await tradingService.submitCredentials(userId, req.body);
+    
+    console.log("\nService returned result:", result);
+    console.log("=== CONTROLLER: submitCredentials END ===\n");
+    
     res.status(201).json({ success: true, ...result });
 });
 
