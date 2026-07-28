@@ -20,7 +20,11 @@ const validateRequest = (schema , property  = "body")=>{
             );
 
         }
-        req[property] =value;
+        if (property === "query" || property === "params") {
+            Object.assign(req[property], value);
+        } else {
+            req[property] = value;
+        }
         next();
 
     }

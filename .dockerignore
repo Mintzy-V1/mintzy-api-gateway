@@ -1,5 +1,8 @@
 node_modules
+.git
 .env
 server.out.log
 server.err.log
 npm-debug.log
+Dockerfile
+.dockerignore
