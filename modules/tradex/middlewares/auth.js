@@ -40,17 +40,6 @@ const authMiddleware = (req, res, next) => {
         }
     }
 
-    const userId =
-        req.headers["x-user-id"] ||
-        req.headers["x-forwarded-user"] ||
-        req.body?.userId ||
-        req.query?.userId;
-
-    if (userId && !req.user) {
-        req.user = { userId };
-        return next();
-    }
-
     return res.status(401).json({
         success: false,
         message: "JWT token is required"
@@ -58,3 +47,6 @@ const authMiddleware = (req, res, next) => {
 };
 
 export default authMiddleware;
+
+
+

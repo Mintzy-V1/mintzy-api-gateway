@@ -13,15 +13,10 @@ import * as dataService from "../services/plugin.data.service.js";
 const MAX_SAVED_TRADING_CONFIGURATIONS = 5;
 
 const getRequestUserId = (req) => {
-    const userId =
-        req.user?.userId ||
-        req.headers["x-user-id"] ||
-        req.headers["x-forwarded-user"] ||
-        req.body?.userId ||
-        req.query?.userId;
+    const userId = req.user?.userId;
 
     if (!userId) {
-        throw new AppError("User ID is required", 400);
+        throw new AppError("Authenticated user ID is required", 401);
     }
 
     return userId;
