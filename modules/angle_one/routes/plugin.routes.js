@@ -105,6 +105,23 @@ router.post('/totp',
   pluginController.submitTotp
 );
 
+router.post('/start-simulation',
+  sanitizeRequest,
+  validateRequest(pluginValidation.startSimulationSchema),
+  pluginController.startSimulation
+);
+
+router.post('/stop-simulation',
+  sanitizeRequest,
+  validateRequest(pluginValidation.stopSimulationSchema),
+  pluginController.stopSimulation
+);
+
+router.get('/simulation/status/:sessionId',
+  validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
+  pluginController.getSimulationStatus
+);
+
 router.post('/start',
   // marketHoursGuard,
   sanitizeRequest,
@@ -177,6 +194,11 @@ router.get('/fetch/all-sessions',
 
 router.get('/debug/all-logs',
   pluginController.getAllTradingLogs
+);
+
+router.get('/debug/trading-logs/:sessionId',
+  validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
+  pluginController.debugTradingLogs
 );
 
 router.get('/debug/final-pnl/:sessionId',

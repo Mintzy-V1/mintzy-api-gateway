@@ -54,6 +54,93 @@ const fetchTradingLogs = async (sessionId) => {
         .toArray();
 };
 
+/**
+ * Debug view of trading_logs for a session (shape, cycles, sample rows).
+ */
+const getTradingLogsDebugView = async (sessionId, options = {}) => {
+    const limit = Math.min(Math.max(Number(options.limit) || 10, 1), 100);
+    const cycleFilter = options.cycle != null && options.cycle !== ''
+        ? Number(options.cycle)
+        : null;
+
+    const logs = await fetchTradingLogs(sessionId);
+    if (!logs.length) {
+        return {
+            session_id: sessionId,
+            total_logs: 0,
+            cycles: [],
+            fields_present: [],
+            final_pnl_stamped_count: 0,
+            latest_by_cycle: {},
+            portfolio_snapshots_by_cycle: {},
+            sample: [],
+            sample_note: 'No logs found'
+        };
+    }
+
+    const fieldsPresent = new Set();
+    for (const log of logs) {
+        Object.keys(log).forEach((key) => fieldsPresent.add(key));
+    }
+
+    const cycleSet = new Set(logs.map((log) => Number(log.cycle ?? 0)));
+    const cycles = [...cycleSet].sort((a, b) => a - b);
+
+    const logsByCycle = new Map();
+    for (const log of logs) {
+        const cycle = Number(log.cycle ?? 0);
+        if (!logsByCycle.has(cycle)) logsByCycle.set(cycle, []);
+        logsByCycle.get(cycle).push(log);
+    }
+
+    const latestByCycle = {};
+    const portfolioSnapshotsByCycle = {};
+
+    for (const cycle of cycles) {
+        const cycleLogs = logsByCycle.get(cycle) || [];
+        const latest = cycleLogs[cycleLogs.length - 1];
+        const symbols = [...new Set(cycleLogs.map((log) => log.symbol).filter(Boolean))];
+
+        latestByCycle[cycle] = {
+            timestamp: latest?.timestamp ?? null,
+            log_count: cycleLogs.length,
+            symbol_count: symbols.length,
+            symbols
+        };
+
+        portfolioSnapshotsByCycle[cycle] = {
+            timestamp: latest?.timestamp ?? null,
+            cash_balance: latest?.cash_balance ?? latest?.portfolio_cash_balance ?? null,
+            realized_pnl: latest?.realized_pnl ?? latest?.portfolio_realized_pnl ?? null,
+            unrealized_pnl: latest?.unrealized_pnl ?? latest?.portfolio_unrealized_pnl ?? null,
+            portfolio_pnl: latest?.portfolio_pnl ?? latest?.pnl ?? null,
+            total_equity: latest?.total_equity ?? latest?.portfolio_total_equity ?? null,
+            final_pnl: latest?.final_pnl ?? null
+        };
+    }
+
+    let sampleSource = logs;
+    if (Number.isFinite(cycleFilter)) {
+        sampleSource = logs.filter((log) => Number(log.cycle ?? 0) === cycleFilter);
+    }
+
+    const sample = sampleSource.slice(-limit);
+
+    return {
+        session_id: sessionId,
+        total_logs: logs.length,
+        cycles,
+        fields_present: [...fieldsPresent].sort(),
+        final_pnl_stamped_count: logs.filter((log) => log.final_pnl != null).length,
+        latest_by_cycle: latestByCycle,
+        portfolio_snapshots_by_cycle: portfolioSnapshotsByCycle,
+        sample,
+        sample_note: Number.isFinite(cycleFilter)
+            ? `Last ${sample.length} log(s) for cycle ${cycleFilter}`
+            : `Last ${sample.length} log(s) across all cycles`
+    };
+};
+
 const DATE_TIMEZONE = 'Asia/Kolkata';
 const LIVE_PNL_HISTORY_LIMIT = 300;
 const LIVE_PNL_SAVE_INTERVAL_MS = 30000;
@@ -193,34 +280,59 @@ const buildEmptyDailyFinalPnl = (year, month) =>
     }));
 
 /**
- * Sum final_pnl for all symbols in the last (max) cycle for a single day's logs.
+ * Resolve per-symbol PnL: prefer stamped final_pnl, else symbol/live pnl fields.
+ */
+const resolveSymbolPnl = (log) => {
+    if (log?.final_pnl != null && !Number.isNaN(Number(log.final_pnl))) {
+        return Number(log.final_pnl);
+    }
+    if (log?.symbol_pnl != null && !Number.isNaN(Number(log.symbol_pnl))) {
+        return Number(log.symbol_pnl);
+    }
+    if (log?.pnl != null && !Number.isNaN(Number(log.pnl))) {
+        return Number(log.pnl);
+    }
+    return null;
+};
+
+const normalizeSymbolKey = (symbol) => {
+    if (typeof symbol !== 'string' || symbol.trim() === '') {
+        return '_unknown';
+    }
+    return symbol.trim().toUpperCase();
+};
+
+/**
+ * Sum PnL across every symbol in the last (max) cycle for a single day's logs.
+ * Takes the latest log per symbol, then adds each symbol's pnl into the day total.
  */
 const sumFinalPnlForLastCycle = (dayLogs) => {
     if (!Array.isArray(dayLogs) || dayLogs.length === 0) return 0;
 
     const maxCycle = Math.max(...dayLogs.map((log) => Number(log.cycle ?? 0)));
     const lastCycleLogs = dayLogs.filter((log) => Number(log.cycle ?? 0) === maxCycle);
-    const bySymbol = new Map();
+    const latestLogBySymbol = new Map();
 
     for (const log of lastCycleLogs) {
-        const symbol = log.symbol || '_unknown';
-        const existing = bySymbol.get(symbol);
+        const symbolKey = normalizeSymbolKey(log.symbol);
+        const existing = latestLogBySymbol.get(symbolKey);
         if (!existing || new Date(existing.timestamp) < new Date(log.timestamp)) {
-            bySymbol.set(symbol, log);
+            latestLogBySymbol.set(symbolKey, log);
         }
     }
 
     let total = 0;
-    for (const log of bySymbol.values()) {
-        if (log.final_pnl == null || Number.isNaN(Number(log.final_pnl))) continue;
-        total += Number(log.final_pnl);
+    for (const log of latestLogBySymbol.values()) {
+        const pnlValue = resolveSymbolPnl(log);
+        if (pnlValue == null) continue;
+        total += pnlValue;
     }
 
     return Number(total.toFixed(2));
 };
 
 /**
- * Map each calendar date (IST) to last-cycle summed final_pnl for that day.
+ * Map each calendar date (IST) to last-cycle summed PnL for that day (per session).
  */
 const computeLastCycleFinalPnlByDate = (logs) => {
     const logsByDate = new Map();
@@ -465,34 +577,34 @@ const getUserTradingPnlSummary = async (userId, year, month) => {
         currentFinalPnl += latestDateKey ? (sessionPnlByDate.get(latestDateKey) ?? 0) : 0;
     }
 
-    const latestTimestamp = Array.from(latestBySession.values()).reduce((latest, log) => {
+    const latestLog = Array.from(latestBySession.values()).reduce((latest, log) => {
         return !latest || new Date(latest.timestamp) < new Date(log.timestamp) ? log : latest;
     }, null);
 
-    const current = latestTimestamp
+    console.log('[aggregate PnL] total_equity per session (latest log each):');
+    for (const [sessionIdValue, log] of latestBySession) {
+        console.log(`  session=${sessionIdValue} total_equity=${log.total_equity ?? 0} timestamp=${log.timestamp}`);
+    }
+    if (latestLog) {
+        console.log('[aggregate PnL] using single latest session snapshot (not summed):', {
+            session_id: latestLog.session_id,
+            total_equity: latestLog.total_equity ?? 0,
+            cash_balance: latestLog.cash_balance ?? 0,
+            timestamp: latestLog.timestamp
+        });
+    }
+
+    // Account snapshots (equity, cash, etc.) reflect one broker account — use the
+    // most recent session only. Summing across historical sessions double-counts.
+    const current = latestLog
         ? {
-              timestamp: latestTimestamp.timestamp,
+              session_id: latestLog.session_id,
+              timestamp: latestLog.timestamp,
               final_pnl: Number(currentFinalPnl.toFixed(2)),
-              realized_pnl: Number(
-                  Array.from(latestBySession.values())
-                      .reduce((sum, log) => sum + Number(log.realized_pnl ?? 0), 0)
-                      .toFixed(2)
-              ),
-              unrealized_pnl: Number(
-                  Array.from(latestBySession.values())
-                      .reduce((sum, log) => sum + Number(log.unrealized_pnl ?? 0), 0)
-                      .toFixed(2)
-              ),
-              total_equity: Number(
-                  Array.from(latestBySession.values())
-                      .reduce((sum, log) => sum + Number(log.total_equity ?? 0), 0)
-                      .toFixed(2)
-              ),
-              cash_balance: Number(
-                  Array.from(latestBySession.values())
-                      .reduce((sum, log) => sum + Number(log.cash_balance ?? 0), 0)
-                      .toFixed(2)
-              )
+              realized_pnl: Number(latestLog.realized_pnl ?? 0),
+              unrealized_pnl: Number(latestLog.unrealized_pnl ?? 0),
+              total_equity: Number(latestLog.total_equity ?? 0),
+              cash_balance: Number(latestLog.cash_balance ?? 0)
           }
         : null;
 
@@ -1006,6 +1118,7 @@ const getLivePnlHistory = async (userId, sessionId, marketDate) => {
 
 export {
     fetchTradingLogs,
+    getTradingLogsDebugView,
     fetchSessionStatus,
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
@@ -1030,6 +1143,7 @@ export {
 
 export default {
     fetchTradingLogs,
+    getTradingLogsDebugView,
     fetchSessionStatus,
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
