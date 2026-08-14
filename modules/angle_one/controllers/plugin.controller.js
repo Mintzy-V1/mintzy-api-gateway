@@ -9,6 +9,7 @@ import * as proxyService from "../services/plugin.proxy.service.js";
 import * as tradingService from "../services/plugin.trading.service.js";
 import * as adminService from "../services/plugin.admin.service.js";
 import * as dataService from "../services/plugin.data.service.js";
+import * as simulationService from "../services/plugin.simulation.service.js";
 
 const MAX_SAVED_TRADING_CONFIGURATIONS = 5;
 
@@ -160,7 +161,7 @@ const getActiveSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     const session = await TradingSession.findOne({
         user_id: userId,
-        status: { $in: ["credentials_received", "authenticated", "trading_active"] }
+        status: { $in: ["credentials_received", "authenticated", "simulation_active", "trading_active"] }
     }).sort({ created_at: -1 });
 
     if (!session) {
@@ -200,6 +201,34 @@ const submitTotp = catchAsync(async (req, res) => {
     console.log("inside the submittotp function inside plugincontroller")
     const userId = getRequestUserId(req);
     const result = await tradingService.verifyTotp(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Start morning simulation (Angel One hybrid flow)
+ */
+const startSimulation = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const result = await simulationService.startSimulation(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Stop simulation, apply winning symbols, and start live trading
+ */
+const stopSimulation = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const result = await simulationService.stopSimulation(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Get simulation status for a session
+ */
+const getSimulationStatus = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const { sessionId } = req.params;
+    const result = await simulationService.getSimulationStatus(userId, sessionId);
     res.status(200).json({ success: true, ...result });
 });
 
@@ -556,6 +585,26 @@ const getAllTradingLogs = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc [DEBUG] Inspect trading_logs shape, cycles, and sample rows
+ */
+const debugTradingLogs = catchAsync(async (req, res) => {
+    const { sessionId } = req.params;
+    const { limit, cycle } = req.query;
+
+    const debugView = await dataService.getTradingLogsDebugView(sessionId, { limit, cycle });
+
+    if (debugView.total_logs === 0) {
+        return res.status(404).json({
+            success: false,
+            message: 'No trading logs found for this session',
+            session_id: sessionId
+        });
+    }
+
+    res.status(200).json({ success: true, ...debugView });
+});
+
+/**
  * @desc [TEST] Check if final_pnl was stamped on trading_logs for a session
  */
 const testFinalPnl = catchAsync(async (req, res) => {
@@ -667,6 +716,9 @@ export {
     getSessionById,
     submitCredentials,
     submitTotp,
+    startSimulation,
+    stopSimulation,
+    getSimulationStatus,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -694,6 +746,7 @@ export {
     getLivePnl,
     getLivePnlHistory,
     testFinalPnl,
+    debugTradingLogs,
     debugStopPluginSession
 };
 
@@ -708,6 +761,9 @@ export default {
     getSessionById,
     submitCredentials,
     submitTotp,
+    startSimulation,
+    stopSimulation,
+    getSimulationStatus,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -735,5 +791,6 @@ export default {
     getLivePnl,
     getLivePnlHistory,
     testFinalPnl,
+    debugTradingLogs,
     debugStopPluginSession
 };

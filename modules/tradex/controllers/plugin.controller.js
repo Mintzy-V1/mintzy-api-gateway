@@ -578,6 +578,26 @@ const getAllTradingLogs = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc [DEBUG] Inspect trading_logs shape, cycles, and sample rows
+ */
+const debugTradingLogs = catchAsync(async (req, res) => {
+    const { sessionId } = req.params;
+    const { limit, cycle } = req.query;
+
+    const debugView = await dataService.getTradingLogsDebugView(sessionId, { limit, cycle });
+
+    if (debugView.total_logs === 0) {
+        return res.status(404).json({
+            success: false,
+            message: 'No trading logs found for this session',
+            session_id: sessionId
+        });
+    }
+
+    res.status(200).json({ success: true, ...debugView });
+});
+
+/**
  * @desc [TEST] Check if final_pnl was stamped on trading_logs for a session
  */
 const testFinalPnl = catchAsync(async (req, res) => {
@@ -735,6 +755,7 @@ export {
     getLivePnl,
     getLivePnlHistory,
     testFinalPnl,
+    debugTradingLogs,
     debugStopPluginSession
 };
 
@@ -777,6 +798,7 @@ export default {
     getLivePnl,
     getLivePnlHistory,
     testFinalPnl,
+    debugTradingLogs,
     debugStopPluginSession
 };
 

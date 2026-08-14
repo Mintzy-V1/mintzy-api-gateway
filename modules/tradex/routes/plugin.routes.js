@@ -237,6 +237,11 @@ router.get('/debug/all-logs',
   pluginController.getAllTradingLogs
 );
 
+router.get('/debug/trading-logs/:sessionId',
+  validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
+  pluginController.debugTradingLogs
+);
+
 router.get('/debug/final-pnl/:sessionId',
   pluginController.testFinalPnl
 );

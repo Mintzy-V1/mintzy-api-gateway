@@ -10,8 +10,62 @@ import {
 import * as dataService from "./plugin.data.service.js";
 import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
+import { buildLiveTradingStartPayload } from "./plugin.payload.util.js";
 
 const AUTO_AUTH_PLUGIN_BASE_URL = process.env.PLUGIN_AUTO_AUTH_BASE_URL || "http://32.198.166.49:8000";
+const LIVE_TRADING_ACTIVE_STATUSES = ["trading_active", "running", "started"];
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "2000", 10);
+
+const isLivePluginStatus = (status) => LIVE_TRADING_ACTIVE_STATUSES.includes(status);
+
+const isTransientStopSimulationFailure = (err) => {
+    if (!err) return false;
+
+    const statusCode = err.statusCode || err.response?.status;
+    if (statusCode === 502 || statusCode === 503 || statusCode === 504) {
+        return true;
+    }
+
+    const message = String(err.message || "").toLowerCase();
+    return (
+        message.includes("timeout")
+        || message.includes("timed out")
+        || message.includes("fetch failed")
+        || message.includes("network")
+        || message.includes("econnrefused")
+        || message.includes("econnreset")
+        || message.includes("socket hang up")
+    );
+};
+
+const invokeStopSimulationPlugin = async (userId, sessionId, targetBaseUrl, stopRequestTimeoutMs) => {
+    const pluginRes = await forwardToPlugin(
+        `/api/trading/stop-simulation/${sessionId}`,
+        "post",
+        {},
+        { "X-Forwarded-User": userId.toString() },
+        {},
+        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: 0 }
+    );
+
+    if (!pluginRes?.data || typeof pluginRes.data !== "object") {
+        throw new AppError("Plugin stop-simulation returned empty or invalid response", 502);
+    }
+
+    return pluginRes;
+};
+
+const extractPluginErrorDetail = (err) => {
+    const detail = err?.details?.detail ?? err?.details ?? err?.message;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object") {
+        return JSON.stringify(detail);
+    }
+    return "";
+};
 
 const checkMarketHours = () => {
     const now = new Date();
@@ -118,6 +172,11 @@ const verifyTotp = async (userId, payload = {}) => {
 };
 
 const startTrading = async (userId, payload = {}) => {
+    console.log("\n[SIM-HANDOFF-DEBUG] startTrading START", {
+        userId: userId?.toString(),
+        payload
+    });
+
     const {
         session_id: rawSessionId,
         saved_configuration_id,
@@ -136,9 +195,21 @@ const startTrading = async (userId, payload = {}) => {
     const targetBaseUrl = resolvePluginTargetUrl(ts);
     let savedConfiguration = null;
 
-    if (saved_configuration_id) {
+    console.log("[SIM-HANDOFF-DEBUG] startTrading session lookup", {
+        session_id,
+        targetBaseUrl,
+        gatewayStatus: ts?.status || null,
+        saved_configuration_id: saved_configuration_id || ts?.saved_configuration_id?.toString() || null
+    });
+
+    const resolvedSavedConfigurationId =
+        saved_configuration_id
+        || ts?.saved_configuration_id?.toString()
+        || null;
+
+    if (resolvedSavedConfigurationId) {
         savedConfiguration = await SavedTradingConfiguration.findOne({
-            _id: saved_configuration_id,
+            _id: resolvedSavedConfigurationId,
             user_id: userId
         }).lean();
 
@@ -147,12 +218,26 @@ const startTrading = async (userId, payload = {}) => {
         }
     }
 
-    const resolvedTradingConfiguration = savedConfiguration?.configuration || {};
-    const startPayload = {
-        ...resolvedTradingConfiguration,
-        ...runtimeOverrides,
-        session_id
-    };
+    const startPayload = buildLiveTradingStartPayload(
+        savedConfiguration?.configuration || {},
+        runtimeOverrides,
+        session_id,
+        { saved_configuration_id: resolvedSavedConfigurationId }
+    );
+
+    if (!Array.isArray(startPayload.symbols) || startPayload.symbols.length === 0) {
+        throw new AppError("Live trading configuration has no valid symbols", 400);
+    }
+
+    console.log("[SIM-HANDOFF-DEBUG] startTrading payload built", {
+        session_id,
+        strategy: startPayload.strategy,
+        configuration_id: startPayload.configuration_id || null,
+        symbolCount: startPayload.symbols.length,
+        time_frame: startPayload.time_frame,
+        candle: startPayload.candle,
+        use_broker_cash: startPayload.use_broker_cash
+    });
 
     const statusRes = await forwardToPlugin(
         `/api/session/${session_id}/status`,
@@ -164,9 +249,19 @@ const startTrading = async (userId, payload = {}) => {
     );
 
     const pluginStatus = statusRes && (statusRes.data?.status || null);
+    console.log("[SIM-HANDOFF-DEBUG] startTrading pre-start plugin status", {
+        session_id,
+        pluginStatus,
+        statusResponse: statusRes?.data || null
+    });
+
     const isAuthenticated = pluginStatus && ["authenticated", "running", "started", "trading_active", "credentials_received"].includes(pluginStatus);
 
     if (!isAuthenticated) {
+        console.log("[SIM-HANDOFF-DEBUG] startTrading ABORT — session not authenticated", {
+            session_id,
+            pluginStatus
+        });
         throw new AppError(`Session not authenticated. Current status: ${pluginStatus || "[no-status]"}`, 401);
     }
 
@@ -178,14 +273,86 @@ const startTrading = async (userId, payload = {}) => {
         });
     }
 
-    const pluginRes = await forwardToPlugin(
-        "/api/trading/start",
-        "post",
-        startPayload,
-        { "X-Forwarded-User": userId.toString() },
-        {},
-        { targetBaseUrl }
-    );
+    let pluginRes = null;
+
+    if (isLivePluginStatus(pluginStatus)) {
+        console.log("[SIM-HANDOFF-DEBUG] startTrading SKIP — plugin already live", {
+            session_id,
+            pluginStatus
+        });
+        pluginRes = {
+            status: 200,
+            data: {
+                success: true,
+                message: "Trading already active on plugin",
+                session_id,
+                skipped: true
+            }
+        };
+    } else {
+        console.log("[SIM-HANDOFF-DEBUG] startTrading calling POST /api/trading/start", {
+            session_id,
+            targetBaseUrl
+        });
+
+        try {
+            pluginRes = await forwardToPlugin(
+                "/api/trading/start",
+                "post",
+                startPayload,
+                { "X-Forwarded-User": userId.toString() },
+                {},
+                { targetBaseUrl }
+            );
+        } catch (err) {
+            const detail = extractPluginErrorDetail(err);
+
+            if (detail.toLowerCase().includes("already running")) {
+                console.log("[SIM-HANDOFF-DEBUG] startTrading already-running — polling for live confirmation", {
+                    session_id,
+                    detail
+                });
+
+                for (let attempt = 1; attempt <= 5; attempt += 1) {
+                    await sleep(1000 * attempt);
+
+                    const retryStatusRes = await forwardToPlugin(
+                        `/api/session/${session_id}/status`,
+                        "get",
+                        null,
+                        { "X-Forwarded-User": userId.toString() },
+                        {},
+                        { timeoutMs: 8000, retries: 0, failOnError: false, targetBaseUrl }
+                    );
+                    const retryStatus = retryStatusRes?.data?.status || null;
+
+                    if (isLivePluginStatus(retryStatus)) {
+                        pluginRes = {
+                            status: 200,
+                            data: {
+                                success: true,
+                                message: "Trading already active on plugin (recovered from already-running)",
+                                session_id,
+                                skipped: true,
+                                plugin_status: retryStatus
+                            }
+                        };
+                        break;
+                    }
+                }
+            }
+
+            if (!pluginRes) {
+                throw err;
+            }
+        }
+    }
+
+    console.log("[SIM-HANDOFF-DEBUG] startTrading plugin response", {
+        session_id,
+        status: pluginRes?.status,
+        data: pluginRes?.data
+    });
 
     if (ts) {
         ts.status = "trading_active";
@@ -208,7 +375,98 @@ const startTrading = async (userId, payload = {}) => {
         });
     });
 
+    console.log("[SIM-HANDOFF-DEBUG] startTrading END — gateway session marked trading_active", {
+        session_id,
+        strategy: startPayload.strategy
+    });
+
     return pluginRes ? pluginRes.data : null;
+};
+
+const stopSimulationTrading = async (userId, sessionId) => {
+    const endpointStartedMs = Date.now();
+    console.log("\n[SIM-HANDOFF-DEBUG] stopSimulationTrading START", {
+        userId: userId?.toString(),
+        sessionId
+    });
+    console.log("[SIM-GW-TIMING] stopSimulationTrading ENTER", {
+        userId: userId?.toString(),
+        sessionId,
+        pluginPath: `/api/trading/stop-simulation/${sessionId}`,
+        body: "(empty — session_id is path param only; matches plugin TradingConfig-free endpoint)"
+    });
+
+    logger.info("Stopping Angle One simulation worker", { userId, sessionId });
+
+    const lookupStartedMs = Date.now();
+    const ts = await TradingSession.findOne({ python_session_id: sessionId });
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
+
+    console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading target", {
+        sessionId,
+        targetBaseUrl,
+        gatewayStatus: ts?.status || null,
+        vm_url: ts?.vm_url || null,
+        stored_configuration_id: ts?.saved_configuration_id?.toString?.() || null,
+        sessionLookupMs: Date.now() - lookupStartedMs
+    });
+
+    const stopRequestTimeoutMs = parseInt(process.env.SIMULATION_STOP_REQUEST_TIMEOUT || "120000", 10);
+    const pluginCallStartedMs = Date.now();
+
+    let pluginRes = null;
+    let attempt = 1;
+
+    try {
+        pluginRes = await invokeStopSimulationPlugin(
+            userId,
+            sessionId,
+            targetBaseUrl,
+            stopRequestTimeoutMs
+        );
+    } catch (firstErr) {
+        if (!isTransientStopSimulationFailure(firstErr)) {
+            throw firstErr;
+        }
+
+        console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading transient failure — retrying once", {
+            sessionId,
+            attempt: 1,
+            error: firstErr.message,
+            statusCode: firstErr.statusCode || firstErr.response?.status || null,
+            retryDelayMs: SIMULATION_STOP_RETRY_DELAY_MS
+        });
+
+        await sleep(SIMULATION_STOP_RETRY_DELAY_MS);
+        attempt = 2;
+        pluginRes = await invokeStopSimulationPlugin(
+            userId,
+            sessionId,
+            targetBaseUrl,
+            stopRequestTimeoutMs
+        );
+    }
+
+    const pluginRoundTripMs = Date.now() - pluginCallStartedMs;
+
+    console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading plugin response", {
+        sessionId,
+        attempt,
+        status: pluginRes?.status,
+        data: pluginRes?.data
+    });
+    console.log("[SIM-GW-TIMING] stopSimulationTrading plugin HTTP done", {
+        sessionId,
+        attempt,
+        pluginRoundTripMs,
+        pluginTimingMs: pluginRes?.data?.timing_ms ?? null,
+        success: pluginRes?.data?.success,
+        configuration_id: pluginRes?.data?.configuration_id ?? null,
+        trading_status: pluginRes?.data?.trading_status ?? null,
+        totalElapsedMs: Date.now() - endpointStartedMs
+    });
+
+    return pluginRes.data;
 };
 
 const stopTrading = async (userId, sessionId) => {
@@ -270,6 +528,7 @@ export {
     submitCredentials,
     verifyTotp,
     startTrading,
+    stopSimulationTrading,
     stopTrading,
     stopTradingSymbol
 };
@@ -278,6 +537,7 @@ export default {
     submitCredentials,
     verifyTotp,
     startTrading,
+    stopSimulationTrading,
     stopTrading,
     stopTradingSymbol
 };
