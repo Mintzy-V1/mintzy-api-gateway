@@ -65,12 +65,81 @@ const deleteAdminSession = async (userId, sessionId) => {
     return data;
 };
 
+const forceStopAll = async (userId) => {
+    logger.warn("[BearStreet Admin] Force-stopping ALL sessions", { userId });
+
+    const r = await forwardToPlugin(
+        "/api/admin/force-stop-all",
+        "post",
+        null,
+        { "X-Forwarded-User": userId.toString() },
+        {},
+        { timeoutMs: 20000 }
+    );
+
+    await TradingSession.updateMany(
+        { status: { $in: ["trading_active", "running", "started"] } },
+        { $set: { status: "stopped", ended_at: new Date() } }
+    );
+
+    return r.data;
+};
+
+const flushSessions = async (userId) => {
+    logger.info("[BearStreet Admin] Flushing all sessions for user", { userId });
+    return TradingSession.deleteMany({ user_id: userId });
+};
+
+const deleteInvalidSessions = async () => {
+    logger.info("[BearStreet Admin] Cleaning up invalid sessions");
+    return TradingSession.deleteMany({
+        status: "credentials_received",
+        $or: [
+            { python_session_id: { $exists: false } },
+            { python_session_id: null },
+            { python_session_id: "" }
+        ]
+    });
+};
+
+const stopOldSessions = async () => {
+    logger.info("[BearStreet Maintenance] Stopping old active sessions");
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    return TradingSession.updateMany(
+        {
+            created_at: { $lt: startOfToday },
+            status: { $ne: "stopped" }
+        },
+        {
+            $set: { status: "stopped", ended_at: new Date() }
+        }
+    );
+};
+
+const deleteTradingSessionByIdParam = async (userId, sessionId) => {
+    logger.info("[BearStreet Admin] Deleting session by ID", { userId, sessionId });
+    return TradingSession.findOneAndDelete({ _id: sessionId, user_id: userId });
+};
+
 export {
     adminStopSession,
-    deleteAdminSession
+    deleteAdminSession,
+    forceStopAll,
+    flushSessions,
+    deleteInvalidSessions,
+    stopOldSessions,
+    deleteTradingSessionByIdParam
 };
 
 export default {
     adminStopSession,
-    deleteAdminSession
+    deleteAdminSession,
+    forceStopAll,
+    flushSessions,
+    deleteInvalidSessions,
+    stopOldSessions,
+    deleteTradingSessionByIdParam
 };

@@ -10,6 +10,60 @@ import {
 import * as dataService from "./plugin.data.service.js";
 import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
+import { buildLiveTradingStartPayload } from "./plugin.payload.util.js";
+
+const LIVE_TRADING_ACTIVE_STATUSES = ["trading_active", "running", "started"];
+const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "2000", 10);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isLivePluginStatus = (status) => LIVE_TRADING_ACTIVE_STATUSES.includes(status);
+
+const isTransientStopSimulationFailure = (err) => {
+    if (!err) return false;
+
+    const statusCode = err.statusCode || err.response?.status;
+    if (statusCode === 502 || statusCode === 503 || statusCode === 504) {
+        return true;
+    }
+
+    const message = String(err.message || "").toLowerCase();
+    return (
+        message.includes("timeout")
+        || message.includes("timed out")
+        || message.includes("fetch failed")
+        || message.includes("network")
+        || message.includes("econnrefused")
+        || message.includes("econnreset")
+        || message.includes("socket hang up")
+    );
+};
+
+const invokeStopSimulationPlugin = async (userId, sessionId, targetBaseUrl, stopRequestTimeoutMs) => {
+    const pluginRes = await forwardToPlugin(
+        `/api/trading/stop-simulation/${sessionId}`,
+        "post",
+        {},
+        { "X-Forwarded-User": userId.toString() },
+        {},
+        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: 0 }
+    );
+
+    if (!pluginRes?.data || typeof pluginRes.data !== "object") {
+        throw new AppError("Plugin stop-simulation returned empty or invalid response", 502);
+    }
+
+    return pluginRes;
+};
+
+const extractPluginErrorDetail = (err) => {
+    const detail = err?.details?.detail ?? err?.details ?? err?.message;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object") {
+        return JSON.stringify(detail);
+    }
+    return "";
+};
 
 const AUTO_AUTH_PLUGIN_BASE_URL = process.env.PLUGIN_AUTO_AUTH_BASE_URL || "http://32.198.166.49:8000";
 const TRADEX_BASE_URL = "https://tradex.markethubonline.com:30001/TradeXApi/v1";
@@ -235,9 +289,14 @@ const startTrading = async (userId, payload = {}) => {
     const targetBaseUrl = resolvePluginTargetUrl(ts);
     let savedConfiguration = null;
 
-    if (saved_configuration_id) {
+    const resolvedSavedConfigurationId =
+        saved_configuration_id
+        || ts?.saved_configuration_id?.toString()
+        || null;
+
+    if (resolvedSavedConfigurationId) {
         savedConfiguration = await SavedTradingConfiguration.findOne({
-            _id: saved_configuration_id,
+            _id: resolvedSavedConfigurationId,
             user_id: userId
         }).lean();
 
@@ -246,12 +305,19 @@ const startTrading = async (userId, payload = {}) => {
         }
     }
 
-    const resolvedTradingConfiguration = savedConfiguration?.configuration || {};
-    const startPayload = {
-        ...resolvedTradingConfiguration,
-        ...runtimeOverrides,
-        session_id
-    };
+    const startPayload = buildLiveTradingStartPayload(
+        savedConfiguration?.configuration || {},
+        runtimeOverrides,
+        session_id,
+        {
+            saved_configuration_id: resolvedSavedConfigurationId,
+            leverage_multiplier: savedConfiguration?.leverage_multiplier
+        }
+    );
+
+    if (!Array.isArray(startPayload.symbols) || startPayload.symbols.length === 0) {
+        throw new AppError("Live trading configuration has no valid symbols", 400);
+    }
 
     const statusRes = await forwardToPlugin(
         `/api/session/${session_id}/status`,
@@ -277,17 +343,70 @@ const startTrading = async (userId, payload = {}) => {
         });
     }
 
-    const pluginRes = await forwardToPlugin(
-        "/api/trading/start",
-        "post",
-        startPayload,
-        { "X-Forwarded-User": userId.toString() },
-        {},
-        { targetBaseUrl }
-    );
+    let pluginRes = null;
+
+    if (isLivePluginStatus(pluginStatus)) {
+        pluginRes = {
+            status: 200,
+            data: {
+                success: true,
+                message: "Trading already active on plugin",
+                session_id,
+                skipped: true
+            }
+        };
+    } else {
+        try {
+            pluginRes = await forwardToPlugin(
+                "/api/trading/start",
+                "post",
+                startPayload,
+                { "X-Forwarded-User": userId.toString() },
+                {},
+                { targetBaseUrl }
+            );
+        } catch (err) {
+            const detail = extractPluginErrorDetail(err);
+
+            if (detail.toLowerCase().includes("already running")) {
+                for (let attempt = 1; attempt <= 5; attempt += 1) {
+                    await sleep(1000 * attempt);
+
+                    const retryStatusRes = await forwardToPlugin(
+                        `/api/session/${session_id}/status`,
+                        "get",
+                        null,
+                        { "X-Forwarded-User": userId.toString() },
+                        {},
+                        { timeoutMs: 8000, retries: 0, failOnError: false, targetBaseUrl }
+                    );
+                    const retryStatus = retryStatusRes?.data?.status || null;
+
+                    if (isLivePluginStatus(retryStatus)) {
+                        pluginRes = {
+                            status: 200,
+                            data: {
+                                success: true,
+                                message: "Trading already active on plugin (recovered from already-running)",
+                                session_id,
+                                skipped: true,
+                                plugin_status: retryStatus
+                            }
+                        };
+                        break;
+                    }
+                }
+            }
+
+            if (!pluginRes) {
+                throw err;
+            }
+        }
+    }
 
     if (ts) {
         ts.status = "trading_active";
+        ts.broker = ts.broker || "tradex";
         ts.saved_configuration_id = savedConfiguration?._id;
         ts.configuration_name = savedConfiguration?.name || configuration_name || null;
         ts.trading_configuration = startPayload;
@@ -308,6 +427,39 @@ const startTrading = async (userId, payload = {}) => {
     });
 
     return pluginRes ? pluginRes.data : null;
+};
+
+const stopSimulationTrading = async (userId, sessionId) => {
+    logger.info("Stopping TradeX simulation worker", { userId, sessionId });
+
+    const ts = await TradingSession.findOne({ python_session_id: sessionId });
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
+    const stopRequestTimeoutMs = parseInt(process.env.SIMULATION_STOP_REQUEST_TIMEOUT || "120000", 10);
+
+    let pluginRes = null;
+
+    try {
+        pluginRes = await invokeStopSimulationPlugin(
+            userId,
+            sessionId,
+            targetBaseUrl,
+            stopRequestTimeoutMs
+        );
+    } catch (firstErr) {
+        if (!isTransientStopSimulationFailure(firstErr)) {
+            throw firstErr;
+        }
+
+        await sleep(SIMULATION_STOP_RETRY_DELAY_MS);
+        pluginRes = await invokeStopSimulationPlugin(
+            userId,
+            sessionId,
+            targetBaseUrl,
+            stopRequestTimeoutMs
+        );
+    }
+
+    return pluginRes.data;
 };
 
 const stopTrading = async (userId, sessionId) => {
@@ -369,6 +521,7 @@ export {
     submitCredentials,
     verifyTotp,
     startTrading,
+    stopSimulationTrading,
     stopTrading,
     stopTradingSymbol
 };
@@ -377,6 +530,7 @@ export default {
     submitCredentials,
     verifyTotp,
     startTrading,
+    stopSimulationTrading,
     stopTrading,
     stopTradingSymbol
 };

@@ -65,6 +65,12 @@ router.put('/saved-configurations/:configId',
   pluginController.updateSavedTradingConfiguration
 );
 
+router.patch('/saved-configurations/leverage',
+  sanitizeRequest,
+  validateRequest(pluginValidation.updateLeverageMultiplierSchema),
+  pluginController.updateLeverageMultiplier
+);
+
 router.delete('/saved-configurations/:configId',
   validateRequest(pluginValidation.savedConfigurationParamSchema, 'params'),
   pluginController.deleteSavedTradingConfiguration
@@ -120,6 +126,11 @@ router.post('/stop-simulation',
 router.get('/simulation/status/:sessionId',
   validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
   pluginController.getSimulationStatus
+);
+
+router.get('/trading/pyramid-pnl/:sessionId',
+  validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
+  pluginController.getPyramidPnl
 );
 
 router.post('/start',

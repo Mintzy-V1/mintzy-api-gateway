@@ -222,7 +222,10 @@ const startTrading = async (userId, payload = {}) => {
         savedConfiguration?.configuration || {},
         runtimeOverrides,
         session_id,
-        { saved_configuration_id: resolvedSavedConfigurationId }
+        {
+            saved_configuration_id: resolvedSavedConfigurationId,
+            leverage_multiplier: savedConfiguration?.leverage_multiplier
+        }
     );
 
     if (!Array.isArray(startPayload.symbols) || startPayload.symbols.length === 0) {
@@ -236,7 +239,8 @@ const startTrading = async (userId, payload = {}) => {
         symbolCount: startPayload.symbols.length,
         time_frame: startPayload.time_frame,
         candle: startPayload.candle,
-        use_broker_cash: startPayload.use_broker_cash
+        use_broker_cash: startPayload.use_broker_cash,
+        leverage_multiplier: startPayload.leverage_multiplier ?? null
     });
 
     const statusRes = await forwardToPlugin(
@@ -461,8 +465,10 @@ const stopSimulationTrading = async (userId, sessionId) => {
         pluginRoundTripMs,
         pluginTimingMs: pluginRes?.data?.timing_ms ?? null,
         success: pluginRes?.data?.success,
+        live_allowed: pluginRes?.data?.live_allowed,
         configuration_id: pluginRes?.data?.configuration_id ?? null,
         trading_status: pluginRes?.data?.trading_status ?? null,
+        pyramid_reason: pluginRes?.data?.pyramid?.reason ?? null,
         totalElapsedMs: Date.now() - endpointStartedMs
     });
 

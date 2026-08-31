@@ -9,6 +9,7 @@ import * as proxyService from "../services/plugin.proxy.service.js";
 import * as tradingService from "../services/plugin.trading.service.js";
 import * as adminService from "../services/plugin.admin.service.js";
 import * as dataService from "../services/plugin.data.service.js";
+import * as simulationService from "../services/plugin.simulation.service.js";
 
 const MAX_SAVED_TRADING_CONFIGURATIONS = 5;
 
@@ -154,13 +155,38 @@ const deleteSavedTradingConfiguration = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc Set or update leverage_multiplier on a saved trading configuration
+ */
+const updateLeverageMultiplier = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const configuration_id = req.body.configuration_id || req.body.configurationId || req.body.saved_configuration_id;
+    const leverage_multiplier = req.body.leverage_multiplier ?? req.body.leverageMultiplier;
+
+    const configuration = await SavedTradingConfiguration.findOneAndUpdate(
+        { _id: configuration_id, user_id: userId },
+        { $set: { leverage_multiplier } },
+        { new: true, runValidators: true }
+    );
+
+    if (!configuration) {
+        throw new AppError('Saved trading configuration not found', 404);
+    }
+
+    res.status(200).json({
+        success: true,
+        message: 'Leverage multiplier updated successfully',
+        configuration
+    });
+});
+
+/**
  * @desc Get currently active or pending session
  */
 const getActiveSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     const session = await TradingSession.findOne({
         user_id: userId,
-        status: { $in: ["credentials_received", "authenticated", "trading_active"] }
+        status: { $in: ["credentials_received", "authenticated", "simulation_active", "trading_active"] }
     }).sort({ created_at: -1 });
 
     if (!session) {
@@ -215,6 +241,41 @@ const submitTotp = catchAsync(async (req, res) => {
     console.log("inside the submittotp function inside plugincontroller")
     const userId = getRequestUserId(req);
     const result = await tradingService.verifyTotp(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Start morning simulation (TradeX hybrid flow)
+ */
+const startSimulation = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const result = await simulationService.startSimulation(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Stop simulation, apply winning symbols, and start live trading
+ */
+const stopSimulation = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const result = await simulationService.stopSimulation(userId, req.body);
+    res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Get simulation status for a session
+ */
+const getSimulationStatus = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const { sessionId } = req.params;
+    const result = await simulationService.getSimulationStatus(userId, sessionId);
+    res.status(200).json({ success: true, ...result });
+});
+
+const getPyramidPnl = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const { sessionId } = req.params;
+    const result = await dataService.getPyramidPnl(userId, sessionId);
     res.status(200).json({ success: true, ...result });
 });
 
@@ -722,11 +783,16 @@ export {
     getSavedTradingConfigurationById,
     createSavedTradingConfiguration,
     updateSavedTradingConfiguration,
+    updateLeverageMultiplier,
     deleteSavedTradingConfiguration,
     getActiveSession,
     getSessionById,
     submitCredentials,
     submitTotp,
+    startSimulation,
+    stopSimulation,
+    getSimulationStatus,
+    getPyramidPnl,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -765,11 +831,16 @@ export default {
     getSavedTradingConfigurationById,
     createSavedTradingConfiguration,
     updateSavedTradingConfiguration,
+    updateLeverageMultiplier,
     deleteSavedTradingConfiguration,
     getActiveSession,
     getSessionById,
     submitCredentials,
     submitTotp,
+    startSimulation,
+    stopSimulation,
+    getSimulationStatus,
+    getPyramidPnl,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,

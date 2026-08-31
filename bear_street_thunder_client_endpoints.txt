@@ -1,0 +1,330 @@
+BEAR STREET — Thunder Client checklist
+Base URL: http://localhost:3000
+Prefix:   /api/v1/bear_street
+
+Values used below:
+  user_id     = 68a9792152e09e01f14b1da5
+  session_id  = session_20260824054349_957f8917
+
+Header on almost every request (except ones marked NO AUTH):
+  Authorization: Bearer <your_jwt>
+  Content-Type: application/json   (only when there is a JSON body)
+
+Get JWT first:
+  POST http://localhost:3000/api/v1/auth/onboard
+  Body:
+  {
+    "apiKey": "<your_onboard_api_key>"
+  }
+  Copy `jwt` from the response into the Authorization header.
+
+Copy Mongo `_id` later from GET /tradingsessions  →  REPLACE_MONGO_SESSION_ID
+Copy config `_id` later from GET /saved-configurations  →  REPLACE_CONFIG_ID
+
+Suggested order: Auth + GET first. Stop / delete / flush / force-stop LAST.
+
+
+================================================================
+SAFE / READ
+================================================================
+
+1) Plugin health   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/health
+Body: none
+
+2) Debug snapshot   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/debug/snapshot
+Body: none
+
+3) Fetch all sessions   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/fetch/all-sessions
+Body: none
+
+4) Debug all logs   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/debug/all-logs
+Body: none
+
+5) Active session
+GET http://localhost:3000/api/v1/bear_street/trading/active-session
+Body: none
+
+6) List my trading sessions
+GET http://localhost:3000/api/v1/bear_street/tradingsessions
+Body: none
+
+7) List my trading sessions (alias)
+GET http://localhost:3000/api/v1/bear_street/trading/sessions
+Body: none
+
+8) One session by python session_id
+GET http://localhost:3000/api/v1/bear_street/trading/sessions/session_20260824054349_957f8917
+Body: none
+
+9) Session state (latest)
+GET http://localhost:3000/api/v1/bear_street/session
+Body: none
+Optional query: ?token=<restore_token>
+
+10) Plugin session status   (NO AUTH on this route)
+GET http://localhost:3000/api/v1/bear_street/session/session_20260824054349_957f8917/status
+Body: none
+
+11) Plugin session status (alias)   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/sessions/session_20260824054349_957f8917/status
+Body: none
+
+12) Trading snapshot   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/trading/snapshot/session_20260824054349_957f8917
+Body: none
+
+13) Live PnL
+GET http://localhost:3000/api/v1/bear_street/trading/live-pnl/session_20260824054349_957f8917
+Body: none
+
+14) Live PnL history
+GET http://localhost:3000/api/v1/bear_street/trading/live-pnl/session_20260824054349_957f8917/history
+Body: none
+Optional query: ?date=2026-08-24
+
+15) Dashboard
+GET http://localhost:3000/api/v1/bear_street/dashboard
+Body: none
+Optional query: ?session_id=session_20260824054349_957f8917
+
+16) Dashboard PnL (one session)
+GET http://localhost:3000/api/v1/bear_street/dashboard/pnl?session_id=session_20260824054349_957f8917&year=2026&month=8
+Body: none
+
+17) Dashboard PnL aggregate (user)
+GET http://localhost:3000/api/v1/bear_street/dashboard/pnl/aggregate?year=2026&month=8
+Body: none
+
+18) Session trades   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/sessions/session_20260824054349_957f8917/trades
+Body: none
+
+19) Download session trades CSV   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/sessions/session_20260824054349_957f8917/download
+Body: none
+
+20) Final tradebook (download)
+GET http://localhost:3000/api/v1/bear_street/trading/session_20260824054349_957f8917/final-tradebook
+Body: none
+
+21) Debug trading logs   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/debug/trading-logs/session_20260824054349_957f8917
+Body: none
+Optional query: ?limit=50&cycle=1
+
+22) Debug final PnL stamp   (NO AUTH)
+GET http://localhost:3000/api/v1/bear_street/debug/final-pnl/session_20260824054349_957f8917
+Body: none
+
+23) Admin trading logs
+GET http://localhost:3000/api/v1/bear_street/admin/trading-logs?limit=50
+Body: none
+
+24) Admin trading logs by user
+GET http://localhost:3000/api/v1/bear_street/admin/trading-logs/user/68a9792152e09e01f14b1da5?limit=50
+Body: none
+
+25) Admin trading logs download (zip)
+GET http://localhost:3000/api/v1/bear_street/admin/trading-logs/user/68a9792152e09e01f14b1da5/download
+Body: none
+
+
+================================================================
+SAVED CONFIGURATIONS
+================================================================
+
+26) List saved configs
+GET http://localhost:3000/api/v1/bear_street/saved-configurations
+Body: none
+
+27) Create saved config
+POST http://localhost:3000/api/v1/bear_street/saved-configurations
+Body:
+{
+  "name": "Thunder Client Test Config",
+  "description": "temp config for API testing",
+  "configuration": {
+    "strategy": "C",
+    "time_frame": "3 hours",
+    "candle": "75m",
+    "use_broker_cash": true,
+    "symbols": [
+      { "symbol": "NIFTY", "capital": 100000, "stop_loss": 0.05 }
+    ]
+  }
+}
+Copy `_id` from response → REPLACE_CONFIG_ID
+
+28) Get one saved config
+GET http://localhost:3000/api/v1/bear_street/saved-configurations/REPLACE_CONFIG_ID
+Body: none
+
+29) Update saved config
+PUT http://localhost:3000/api/v1/bear_street/saved-configurations/REPLACE_CONFIG_ID
+Body:
+{
+  "name": "Thunder Client Test Config Updated",
+  "description": "updated description",
+  "configuration": {
+    "strategy": "C",
+    "time_frame": "3 hours",
+    "candle": "75m",
+    "use_broker_cash": true,
+    "symbols": [
+      { "symbol": "NIFTY", "capital": 120000, "stop_loss": 0.05 }
+    ]
+  }
+}
+
+30) Update leverage
+PATCH http://localhost:3000/api/v1/bear_street/saved-configurations/leverage
+Body:
+{
+  "configuration_id": "REPLACE_CONFIG_ID",
+  "leverage_multiplier": 1
+}
+
+31) Delete saved config   (DESTROYS THAT CONFIG)
+DELETE http://localhost:3000/api/v1/bear_street/saved-configurations/REPLACE_CONFIG_ID
+Body: none
+Do this last among config tests, or skip if you want to keep it.
+
+
+================================================================
+AUTH + START  (hits plugin — only if you really want to)
+================================================================
+
+32) Submit credentials
+POST http://localhost:3000/api/v1/bear_street/credentials
+Body:   (userId here is broker client id, NOT the mongo user_id.
+         JWT user is still 68a9792152e09e01f14b1da5)
+{
+  "userId": "<broker_client_userId>",
+  "api_key": "<broker_api_key>",
+  "client_code": "<broker_client_code>",
+  "password": "<broker_password>",
+  "second_auth": "<broker_second_auth>",
+  "source": "WEBAPI"
+}
+Optional extra fields: "base_url", "token"
+This CREATES a new session. Prefer using the existing session_id below instead of calling this unless you need a fresh login.
+
+33) TOTP
+POST http://localhost:3000/api/v1/bear_street/totp
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "totp": "123456"
+}
+
+34) Start simulation  (paper sim — strategy B, then later stop-simulation hands off to live)
+POST http://localhost:3000/api/v1/bear_street/start-simulation
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "saved_configuration_id": "REPLACE_CONFIG_ID"
+}
+
+35) Simulation status
+GET http://localhost:3000/api/v1/bear_street/simulation/status/session_20260824054349_957f8917
+Body: none
+
+36) Stop simulation (pyramid + live handoff)
+POST http://localhost:3000/api/v1/bear_street/stop-simulation
+Body:
+{
+  "session_id": "session_20260824054349_957f8917"
+}
+
+37) Start trading  (LIVE — does not start paper sim)
+POST http://localhost:3000/api/v1/bear_street/start
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "saved_configuration_id": "REPLACE_CONFIG_ID"
+}
+saved_configuration_id is optional if the session already has one.
+
+
+================================================================
+MUTATING / DANGEROUS  — run last, or skip
+================================================================
+
+38) Exit one symbol
+POST http://localhost:3000/api/v1/bear_street/session_20260824054349_957f8917/exit-symbol/NIFTY
+Body: none
+
+39) Abandon session (fails if status is trading_active)
+POST http://localhost:3000/api/v1/bear_street/trading/session_20260824054349_957f8917/abandon
+Body: none
+
+40) Stop trading (path)
+POST http://localhost:3000/api/v1/bear_street/stop/session_20260824054349_957f8917
+Body: none
+
+41) Stop trading (body)
+POST http://localhost:3000/api/v1/bear_street/stop
+Body:
+{
+  "session_id": "session_20260824054349_957f8917"
+}
+
+42) Stop session locally (DB status only)
+POST http://localhost:3000/api/v1/bear_street/sessions/session_20260824054349_957f8917/stop
+Body: none
+
+43) Admin stop session
+POST http://localhost:3000/api/v1/bear_street/admin/sessions/session_20260824054349_957f8917/stop
+Body: none
+
+44) Debug stop plugin session   (NO AUTH)
+POST http://localhost:3000/api/v1/bear_street/debug/stop-plugin-session/session_20260824054349_957f8917
+Body: none
+
+45) Insert fake trades   (NO AUTH — writes fake trades)
+GET http://localhost:3000/api/v1/bear_street/debug/insert-fake-trades/session_20260824054349_957f8917
+Body: none
+
+46) Stop old sessions (all old non-stopped sessions)
+POST http://localhost:3000/api/v1/bear_street/sessions/stop-old
+Body: none
+
+47) Delete invalid sessions
+DELETE http://localhost:3000/api/v1/bear_street/sessions/invalid
+Body: none
+
+48) Delete trading session by python session_id
+DELETE http://localhost:3000/api/v1/bear_street/trading/session/session_20260824054349_957f8917
+Body: none
+This uses Mongo `_id` internally — if 404, use #49 with the `_id` from GET /tradingsessions.
+
+49) Delete trading session by Mongo _id
+DELETE http://localhost:3000/api/v1/bear_street/tradingsession/REPLACE_MONGO_SESSION_ID
+Body: none
+
+50) Admin delete session
+DELETE http://localhost:3000/api/v1/bear_street/admin/sessions/session_20260824054349_957f8917
+Body: none
+
+51) Flush ALL sessions for this JWT user
+DELETE http://localhost:3000/api/v1/bear_street/sessions/flush
+Body: none
+
+52) Force-stop ALL trading sessions
+POST http://localhost:3000/api/v1/bear_street/admin/force-stop-all
+Body: none
+
+
+================================================================
+NOTES
+================================================================
+- JWT user must own the session / config or you get 404 (same as leverage issue).
+- REPLACE_CONFIG_ID must belong to JWT user 68a9792152e09e01f14b1da5.
+- REPLACE_MONGO_SESSION_ID is the TradingSession `_id`, not session_2026...
+- Skip 32, 34–37, 38–52 if you only want to inspect data and not change plugin/DB.
+- POST /start is LIVE. POST /start-simulation is paper sim (strategy B). Do not treat them as the same.
+- leverage_multiplier defaults to 1 when omitted.
