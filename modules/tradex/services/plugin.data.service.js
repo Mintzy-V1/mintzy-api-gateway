@@ -650,6 +650,33 @@ const fetchSessionStatus = async (sessionId) => {
     return session;
 };
 
+const resetPluginSessionToAuthenticated = async (sessionId, metadata = {}) => {
+    const authenticatedAt = new Date();
+    const db = getPluginDb();
+    const collection = db.collection("plugin_sessions");
+
+    const result = await collection.findOneAndUpdate(
+        { session_id: sessionId, status: "trading_active" },
+        {
+            $set: {
+                status: "authenticated",
+                updated_at: authenticatedAt,
+                live_handoff_reset_reason: metadata.reason || "simulation_live_handoff"
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    const session = result?.value || result;
+    logger.info("Reset plugin session from trading_active to authenticated", {
+        sessionId,
+        updated: !!session,
+        reason: metadata.reason || "simulation_live_handoff"
+    });
+
+    return session;
+};
+
 const markPluginSessionAuthenticated = async (sessionId, metadata = {}) => {
     const authenticatedAt = new Date();
     const db = getPluginDb();
@@ -969,6 +996,24 @@ const fetchLivePnlFromPlugin = async (userId, sessionId, targetBaseUrl) => {
     return result?.data ?? result;
 };
 
+const getPyramidPnl = async (userId, sessionId) => {
+    logger.info("Fetching pyramid PnL snapshot", { userId, sessionId });
+    const ts = await mongoose.model("TradingSession").findOne({
+        python_session_id: sessionId,
+        user_id: userId
+    });
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
+    const pluginRes = await forwardToPlugin(
+        `/api/trading/pyramid-pnl/${sessionId}`,
+        "get",
+        null,
+        userId ? { "X-Forwarded-User": userId.toString() } : {},
+        {},
+        { targetBaseUrl }
+    );
+    return pluginRes?.data;
+};
+
 const getLivePnl = async (userId, sessionId) => {
     logger.info("Fetching live PnL", { userId, sessionId });
 
@@ -1120,6 +1165,7 @@ export {
     fetchTradingLogs,
     getTradingLogsDebugView,
     fetchSessionStatus,
+    resetPluginSessionToAuthenticated,
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
@@ -1132,6 +1178,7 @@ export {
     restoreSession,
     getFullSessionState,
     fetchAllTradingLogs,
+    getPyramidPnl,
     getLivePnl,
     getLivePnlHistory,
     saveFinalPnlSnapshot,
@@ -1145,6 +1192,7 @@ export default {
     fetchTradingLogs,
     getTradingLogsDebugView,
     fetchSessionStatus,
+    resetPluginSessionToAuthenticated,
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
@@ -1157,6 +1205,7 @@ export default {
     restoreSession,
     getFullSessionState,
     fetchAllTradingLogs,
+    getPyramidPnl,
     getLivePnl,
     getLivePnlHistory,
     saveFinalPnlSnapshot,

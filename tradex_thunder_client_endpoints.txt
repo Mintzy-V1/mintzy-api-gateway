@@ -1,0 +1,302 @@
+TRADEX — Thunder Client checklist
+Base URL: http://localhost:3000
+Prefix:   /api/v1/tradex
+
+Values used below:
+  user_id     = 68a9792152e09e01f14b1da5
+  session_id  = session_20260824054349_957f8917
+
+Header on almost every request (except ones marked NO AUTH):
+  Authorization: Bearer <your_jwt>
+  Content-Type: application/json   (only when there is a JSON body)
+
+Get JWT first:
+  POST http://localhost:3000/api/v1/auth/onboard
+  Body:
+  {
+    "apiKey": "<your_onboard_api_key>"
+  }
+  Copy `jwt` from the response into the Authorization header.
+
+Copy Mongo `_id` later from GET /tradingsessions  →  REPLACE_MONGO_SESSION_ID
+Copy config `_id` later from GET /saved-configurations  →  REPLACE_CONFIG_ID
+
+Suggested order: Auth + GET first. Simulation / start / stop / delete LAST.
+
+
+================================================================
+SAFE / READ
+================================================================
+
+1) Plugin health   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/health
+Body: none
+
+2) Debug routing
+GET http://localhost:3000/api/v1/tradex/debug/routing
+Body: none
+
+3) Debug test-forward   (NO AUTH)
+POST http://localhost:3000/api/v1/tradex/debug/test-forward
+Body: none  (forwards GET /api/health to http://localhost:8000)
+
+4) Fetch all sessions   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/fetch/all-sessions
+Body: none
+
+5) Debug all logs   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/debug/all-logs
+Body: none
+
+6) Active session
+GET http://localhost:3000/api/v1/tradex/trading/active-session
+Body: none
+
+7) List my trading sessions
+GET http://localhost:3000/api/v1/tradex/tradingsessions
+Body: none
+
+8) List my trading sessions (alias)
+GET http://localhost:3000/api/v1/tradex/trading/sessions
+Body: none
+
+9) One session by python session_id
+GET http://localhost:3000/api/v1/tradex/trading/sessions/session_20260824054349_957f8917
+Body: none
+
+10) Session state (latest)
+GET http://localhost:3000/api/v1/tradex/session
+Body: none
+Optional query: ?token=<restore_token>
+
+11) Plugin session status   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/sessions/session_20260824054349_957f8917/status
+Body: none
+
+12) Live PnL
+GET http://localhost:3000/api/v1/tradex/trading/live-pnl/session_20260824054349_957f8917
+Body: none
+
+13) Live PnL history
+GET http://localhost:3000/api/v1/tradex/trading/live-pnl/session_20260824054349_957f8917/history
+Body: none
+Optional query: ?date=2026-08-24
+
+14) Dashboard
+GET http://localhost:3000/api/v1/tradex/dashboard
+Body: none
+Optional query: ?session_id=session_20260824054349_957f8917
+
+15) Dashboard PnL (one session)
+GET http://localhost:3000/api/v1/tradex/dashboard/pnl?session_id=session_20260824054349_957f8917&year=2026&month=8
+Body: none
+
+16) Dashboard PnL aggregate (user)
+GET http://localhost:3000/api/v1/tradex/dashboard/pnl/aggregate?year=2026&month=8
+Body: none
+
+17) Session trades   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/sessions/session_20260824054349_957f8917/trades
+Body: none
+
+18) Download session trades CSV   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/sessions/session_20260824054349_957f8917/download
+Body: none
+
+19) Final tradebook (download)
+GET http://localhost:3000/api/v1/tradex/trading/session_20260824054349_957f8917/final-tradebook
+Body: none
+
+20) Debug trading logs   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/debug/trading-logs/session_20260824054349_957f8917
+Body: none
+Optional query: ?limit=50&cycle=1
+
+21) Debug final PnL stamp   (NO AUTH)
+GET http://localhost:3000/api/v1/tradex/debug/final-pnl/session_20260824054349_957f8917
+Body: none
+
+22) Simulation status
+GET http://localhost:3000/api/v1/tradex/simulation/status/session_20260824054349_957f8917
+Body: none
+
+
+================================================================
+SAVED CONFIGURATIONS
+================================================================
+
+23) List saved configs
+GET http://localhost:3000/api/v1/tradex/saved-configurations
+Body: none
+
+24) Create saved config
+POST http://localhost:3000/api/v1/tradex/saved-configurations
+Body:
+{
+  "name": "Thunder Client Test Config",
+  "description": "temp config for API testing",
+  "configuration": {
+    "strategy": "C",
+    "time_frame": "3 hours",
+    "candle": "75m",
+    "use_broker_cash": true,
+    "symbols": [
+      { "symbol": "NIFTY", "capital": 100000, "stop_loss": 0.05 }
+    ]
+  }
+}
+Copy `_id` from response → REPLACE_CONFIG_ID
+
+25) Get one saved config
+GET http://localhost:3000/api/v1/tradex/saved-configurations/REPLACE_CONFIG_ID
+Body: none
+
+26) Update saved config
+PUT http://localhost:3000/api/v1/tradex/saved-configurations/REPLACE_CONFIG_ID
+Body:
+{
+  "name": "Thunder Client Test Config Updated",
+  "description": "updated description",
+  "configuration": {
+    "strategy": "C",
+    "time_frame": "3 hours",
+    "candle": "75m",
+    "use_broker_cash": true,
+    "symbols": [
+      { "symbol": "NIFTY", "capital": 120000, "stop_loss": 0.05 }
+    ]
+  }
+}
+
+27) Update leverage
+PATCH http://localhost:3000/api/v1/tradex/saved-configurations/leverage
+Body:
+{
+  "configuration_id": "REPLACE_CONFIG_ID",
+  "leverage_multiplier": 1
+}
+
+28) Delete saved config   (DESTROYS THAT CONFIG)
+DELETE http://localhost:3000/api/v1/tradex/saved-configurations/REPLACE_CONFIG_ID
+Body: none
+Do this last among config tests, or skip if you want to keep it.
+
+
+================================================================
+AUTH + START / SIMULATION  (hits plugin)
+================================================================
+
+29) Submit credentials
+POST http://localhost:3000/api/v1/tradex/credentials
+Body:   (userId here is TradeX broker userId, NOT the mongo user_id.
+         JWT user is still 68a9792152e09e01f14b1da5)
+{
+  "userId": "<tradex_broker_userId>",
+  "access_key": "<tradex_access_key>",
+  "access_secret": "<tradex_access_secret>"
+}
+This CREATES a new session. Prefer using the existing session_id below unless you need a fresh login.
+
+30) TOTP
+POST http://localhost:3000/api/v1/tradex/totp
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "totp": "123456"
+}
+
+31) Start simulation
+POST http://localhost:3000/api/v1/tradex/start-simulation
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "saved_configuration_id": "REPLACE_CONFIG_ID"
+}
+Optional extra field: "trade_date": "2026-08-24"
+
+32) Stop simulation (handoff to live)
+POST http://localhost:3000/api/v1/tradex/stop-simulation
+Body:
+{
+  "session_id": "session_20260824054349_957f8917"
+}
+
+33) Start live trading
+POST http://localhost:3000/api/v1/tradex/start
+Body:
+{
+  "session_id": "session_20260824054349_957f8917",
+  "saved_configuration_id": "REPLACE_CONFIG_ID"
+}
+saved_configuration_id is optional if the session already has one.
+
+
+================================================================
+MUTATING / DANGEROUS  — run last, or skip
+================================================================
+
+34) Exit one symbol
+POST http://localhost:3000/api/v1/tradex/session_20260824054349_957f8917/exit-symbol/NIFTY
+Body: none
+
+35) Abandon session (fails if status is trading_active)
+POST http://localhost:3000/api/v1/tradex/trading/session_20260824054349_957f8917/abandon
+Body: none
+
+36) Stop trading (path)
+POST http://localhost:3000/api/v1/tradex/stop/session_20260824054349_957f8917
+Body: none
+
+37) Stop trading (body)
+POST http://localhost:3000/api/v1/tradex/stop
+Body:
+{
+  "session_id": "session_20260824054349_957f8917"
+}
+
+38) Stop session locally (DB status only)   (NO AUTH on this route)
+POST http://localhost:3000/api/v1/tradex/sessions/session_20260824054349_957f8917/stop
+Body: none
+
+39) Admin stop session
+POST http://localhost:3000/api/v1/tradex/admin/sessions/session_20260824054349_957f8917/stop
+Body: none
+
+40) Debug stop plugin session   (NO AUTH)
+POST http://localhost:3000/api/v1/tradex/debug/stop-plugin-session/session_20260824054349_957f8917
+Body: none
+
+41) Stop old sessions   (NO AUTH)
+POST http://localhost:3000/api/v1/tradex/sessions/stop-old
+Body: none
+
+42) Delete invalid sessions   (NO AUTH)
+DELETE http://localhost:3000/api/v1/tradex/sessions/invalid
+Body: none
+
+43) Delete trading session by python session_id
+DELETE http://localhost:3000/api/v1/tradex/trading/session/session_20260824054349_957f8917
+Body: none
+This uses Mongo `_id` internally — if 404, use #44 with the `_id` from GET /tradingsessions.
+
+44) Delete trading session by Mongo _id
+DELETE http://localhost:3000/api/v1/tradex/tradingsession/REPLACE_MONGO_SESSION_ID
+Body: none
+
+45) Flush ALL sessions for this JWT user
+DELETE http://localhost:3000/api/v1/tradex/sessions/flush
+Body: none
+
+46) Force-stop ALL trading sessions
+POST http://localhost:3000/api/v1/tradex/admin/force-stop-all
+Body: none
+
+
+================================================================
+NOTES
+================================================================
+- JWT user must own the session / config or you get 404.
+- REPLACE_CONFIG_ID must belong to JWT user 68a9792152e09e01f14b1da5.
+- REPLACE_MONGO_SESSION_ID is the TradingSession `_id`, not session_2026...
+- Credentials body is TradeX-specific: userId + access_key + access_secret (not api_key/password).
+- Skip 29–33 and 34–46 if you only want to inspect data and not change plugin/DB.

@@ -155,6 +155,61 @@ const deleteSavedTradingConfiguration = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc Set or update leverage_multiplier on a saved trading configuration
+ */
+const updateLeverageMultiplier = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const configuration_id = req.body.configuration_id || req.body.configurationId || req.body.saved_configuration_id;
+    const leverage_multiplier = req.body.leverage_multiplier ?? req.body.leverageMultiplier;
+
+    console.log("[LEVERAGE-DEBUG] request", {
+        jwtUserId: userId,
+        jwtUserIdType: typeof userId,
+        jwtUserIdString: userId?.toString?.(),
+        configuration_id,
+        configurationIdType: typeof configuration_id,
+        leverage_multiplier,
+        body: req.body
+    });
+
+    const byIdOnly = await SavedTradingConfiguration.findById(configuration_id).lean();
+    console.log("[LEVERAGE-DEBUG] findById only", {
+        found: Boolean(byIdOnly),
+        stored_user_id: byIdOnly?.user_id ?? null,
+        stored_user_id_type: byIdOnly?.user_id != null ? typeof byIdOnly.user_id : null,
+        stored_user_id_constructor: byIdOnly?.user_id?.constructor?.name || null,
+        stored_user_id_string: byIdOnly?.user_id?.toString?.() ?? null,
+        jwt_equals_stored: byIdOnly?.user_id?.toString?.() === userId?.toString?.()
+    });
+
+    const query = { _id: configuration_id, user_id: userId };
+    console.log("[LEVERAGE-DEBUG] findOneAndUpdate query", query);
+
+    const configuration = await SavedTradingConfiguration.findOneAndUpdate(
+        query,
+        { $set: { leverage_multiplier } },
+        { returnDocument: "after", runValidators: true }
+    );
+
+    console.log("[LEVERAGE-DEBUG] findOneAndUpdate result", {
+        found: Boolean(configuration),
+        configurationId: configuration?._id?.toString?.() || null,
+        user_id: configuration?.user_id?.toString?.() || null,
+        leverage_multiplier: configuration?.leverage_multiplier ?? null
+    });
+
+    if (!configuration) {
+        throw new AppError('Saved trading configuration not found', 404);
+    }
+
+    res.status(200).json({
+        success: true,
+        message: 'Leverage multiplier updated successfully',
+        configuration
+    });
+});
+
+/**
  * @desc Get currently active or pending session
  */
 const getActiveSession = catchAsync(async (req, res) => {
@@ -229,6 +284,13 @@ const getSimulationStatus = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     const { sessionId } = req.params;
     const result = await simulationService.getSimulationStatus(userId, sessionId);
+    res.status(200).json({ success: true, ...result });
+});
+
+const getPyramidPnl = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const { sessionId } = req.params;
+    const result = await dataService.getPyramidPnl(userId, sessionId);
     res.status(200).json({ success: true, ...result });
 });
 
@@ -711,6 +773,7 @@ export {
     getSavedTradingConfigurationById,
     createSavedTradingConfiguration,
     updateSavedTradingConfiguration,
+    updateLeverageMultiplier,
     deleteSavedTradingConfiguration,
     getActiveSession,
     getSessionById,
@@ -719,6 +782,7 @@ export {
     startSimulation,
     stopSimulation,
     getSimulationStatus,
+    getPyramidPnl,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -756,6 +820,7 @@ export default {
     getSavedTradingConfigurationById,
     createSavedTradingConfiguration,
     updateSavedTradingConfiguration,
+    updateLeverageMultiplier,
     deleteSavedTradingConfiguration,
     getActiveSession,
     getSessionById,
@@ -764,6 +829,7 @@ export default {
     startSimulation,
     stopSimulation,
     getSimulationStatus,
+    getPyramidPnl,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,

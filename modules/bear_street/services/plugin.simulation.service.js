@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import TradingSession from "../../../models/tradingSession.js";
 import SavedTradingConfiguration from "../../../models/savedTradingConfiguration.js";
 import { startTrading, stopSimulationTrading } from "./plugin.trading.service.js";
-import { forwardToPlugin, resolvePluginTargetUrl } from "./plugin.proxy.service.js";
+import { forwardToPlugin, resolvePluginTargetUrl, PLUGIN_BASE } from "./plugin.proxy.service.js";
 import { buildSimulationStartPayload, normalizeSymbolKey, checkSimulationStartPayloadCompatibility, summarizeSimulationStartPayload } from "./plugin.payload.util.js";
 import * as dataService from "./plugin.data.service.js";
 import AppError from "../utils/AppError.js";
@@ -12,11 +12,12 @@ import logger from "../config/logger.js";
 
 const DATE_TIMEZONE = "Asia/Kolkata";
 
-const SIMULATION_BASE_URL = (process.env.SIMULATION_BASE_URL || "http://18.205.165.28:8000").replace(/\/$/, "");
-const SIMULATION_START_PATH = process.env.SIMULATION_START_PATH || "/api/trading/start-simulation";
-const SIMULATION_JOB_STATUS_PATH = process.env.SIMULATION_JOB_STATUS_PATH || "/start-simulation/:jobId";
-const SIMULATION_STOP_PATH = process.env.SIMULATION_STOP_PATH || "/stop";
-const SIMULATION_STOP_METHOD = (process.env.SIMULATION_STOP_METHOD || "POST").toUpperCase();
+const SIMULATION_BASE_URL = (process.env.BEAR_STREET_SIMULATION_BASE_URL || process.env.SIMULATION_BASE_URL || PLUGIN_BASE).replace(/\/$/, "");
+const SIMULATION_START_PATH = process.env.BEAR_STREET_SIMULATION_START_PATH || process.env.SIMULATION_START_PATH || "/api/trading/start-simulation";
+const SIMULATION_JOB_STATUS_PATH = process.env.BEAR_STREET_SIMULATION_JOB_STATUS_PATH || process.env.SIMULATION_JOB_STATUS_PATH || "/start-simulation/:jobId";
+const SIMULATION_STOP_PATH = process.env.BEAR_STREET_SIMULATION_STOP_PATH || process.env.SIMULATION_STOP_PATH || "/stop";
+const SIMULATION_STOP_METHOD = (process.env.BEAR_STREET_SIMULATION_STOP_METHOD || process.env.SIMULATION_STOP_METHOD || "POST").toUpperCase();
+const BROKER_KEY = "bear_street";
 
 const simGwElapsedMs = (startedAtMs) => Date.now() - startedAtMs;
 
@@ -393,7 +394,7 @@ const startSimulation = async (userId, payload = {}) => {
         );
     }
 
-    logger.info("Starting Angle One simulation", {
+    logger.info("Starting Bear Street simulation", {
         userId,
         session_id,
         saved_configuration_id,
@@ -430,7 +431,7 @@ const startSimulation = async (userId, payload = {}) => {
         throw new AppError(message, 502);
     }
 
-    logger.info("Angle One simulation plugin response received", {
+    logger.info("Bear Street simulation plugin response received", {
         session_id,
         mode: simResponse?.mode,
         strategy: simResponse?.strategy,
@@ -440,7 +441,7 @@ const startSimulation = async (userId, payload = {}) => {
     const job_id = simResponse?.job_id || simResponse?.session_id || session_id;
 
     ts.status = "simulation_active";
-    ts.broker = "angle_one";
+    ts.broker = BROKER_KEY;
     ts.simulation_job_id = job_id;
     ts.simulation_status = mapExternalSimulationStatus(simResponse?.status || "started");
     ts.simulation_started_at = new Date();
@@ -1105,7 +1106,7 @@ const pollDueSimulationJobs = async () => {
 
     try {
         const sessions = await TradingSession.find({
-            broker: "angle_one",
+            broker: BROKER_KEY,
             status: "simulation_active",
             simulation_live_switch_triggered: { $ne: true },
             simulation_job_id: { $exists: true, $ne: null },
@@ -1155,7 +1156,7 @@ const autoStopDueSimulations = async () => {
     }
 
     const sessions = await TradingSession.find({
-        broker: "angle_one",
+        broker: BROKER_KEY,
         status: "simulation_active",
         simulation_trade_date: today
     }).sort({ simulation_started_at: 1 });
@@ -1252,7 +1253,7 @@ const startSimulationJobPoller = () => {
     if (pollerStarted) return;
     pollerStarted = true;
 
-    console.log("[SIM-POLLER-DEBUG] Angle One simulation poller STARTED", {
+    console.log("[SIM-POLLER-DEBUG] Bear Street simulation poller STARTED", {
         at: new Date().toISOString(),
         pollIntervalMs: SIMULATION_POLL_INTERVAL_MS,
         pollStartAtIst: `${SIMULATION_POLL_START_HOUR_IST}:${String(SIMULATION_POLL_START_MINUTE_IST).padStart(2, "0")}`,
@@ -1276,7 +1277,7 @@ const startSimulationJobPoller = () => {
         });
     }, SIMULATION_POLL_INTERVAL_MS);
 
-    logger.info("Angle One simulation poller started", {
+    logger.info("Bear Street simulation poller started", {
         pollIntervalMs: SIMULATION_POLL_INTERVAL_MS,
         pollStartIst: `${SIMULATION_POLL_START_HOUR_IST}:${String(SIMULATION_POLL_START_MINUTE_IST).padStart(2, "0")}`,
         simulationBaseUrl: SIMULATION_BASE_URL || "(not configured)"

@@ -42,7 +42,7 @@ const resolveLeverageMultiplier = (...candidates) => {
         }
     }
 
-    return null;
+    return 1;
 };
 
 const buildSimulationStartPayload = (
@@ -75,17 +75,13 @@ const buildSimulationStartPayload = (
         payload.configuration_id = String(configurationId);
     }
 
-    const resolvedLeverage = resolveLeverageMultiplier(
+    payload.leverage_multiplier = resolveLeverageMultiplier(
         runtimeOverrides.leverage_multiplier,
         runtimeOverrides.leverageMultiplier,
         leverage_multiplier,
         merged.leverage_multiplier,
         merged.leverageMultiplier
     );
-
-    if (resolvedLeverage != null) {
-        payload.leverage_multiplier = resolvedLeverage;
-    }
 
     return payload;
 };
@@ -98,7 +94,7 @@ const PLUGIN_SIMULATION_START_SCHEMA = {
     use_broker_cash: "boolean — gateway sends false for simulation",
     candle: "string (optional)",
     configuration_id: "string (optional) — Mongo SavedTradingConfiguration _id",
-    leverage_multiplier: "number (optional) — root SavedTradingConfiguration.leverage_multiplier or request override"
+    leverage_multiplier: "number — default 1; SavedTradingConfiguration.leverage_multiplier or request override"
 };
 
 const summarizeSimulationStartPayload = (payload = {}) => ({
@@ -193,17 +189,13 @@ const buildLiveTradingStartPayload = (
         payload.configuration_id = String(configurationId);
     }
 
-    const resolvedLeverage = resolveLeverageMultiplier(
+    payload.leverage_multiplier = resolveLeverageMultiplier(
         runtimeOverrides.leverage_multiplier,
         runtimeOverrides.leverageMultiplier,
         leverage_multiplier,
         merged.leverage_multiplier,
         merged.leverageMultiplier
     );
-
-    if (resolvedLeverage != null) {
-        payload.leverage_multiplier = resolvedLeverage;
-    }
 
     return payload;
 };

@@ -85,6 +85,33 @@ const stopTradingByBodySchema = createSchema((body) => {
     return { value: body };
 });
 
+const updateLeverageMultiplierSchema = createSchema((body) => {
+    const configurationId = body.configuration_id || body.configurationId || body.saved_configuration_id;
+    const leverageMultiplier = body.leverage_multiplier ?? body.leverageMultiplier;
+
+    const configError = requireMongoId(configurationId, "configuration_id is required");
+    if (configError) {
+        return { error: validationError(configError) };
+    }
+
+    if (leverageMultiplier === undefined || leverageMultiplier === null || leverageMultiplier === "") {
+        return { error: validationError("leverage_multiplier is required") };
+    }
+
+    const parsed = Number(leverageMultiplier);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+        return { error: validationError("leverage_multiplier must be a number greater than or equal to 0") };
+    }
+
+    return {
+        value: {
+            ...body,
+            configuration_id: String(configurationId).trim(),
+            leverage_multiplier: parsed
+        }
+    };
+});
+
 const pluginValidation = {
     sessionIdParamSchema: passthroughSchema,
     savedConfigurationParamSchema: passthroughSchema,
@@ -99,6 +126,7 @@ const pluginValidation = {
     startSimulationSchema,
     stopSimulationSchema,
     stopTradingByBodySchema,
+    updateLeverageMultiplierSchema,
     mongoIdParamSchema: passthroughSchema,
     dashboardQuerySchema: passthroughSchema,
     pnlQuerySchema: passthroughSchema,

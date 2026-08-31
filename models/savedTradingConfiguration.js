@@ -4,7 +4,8 @@ const savedTradingConfigurationSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   name: { type: String, required: true, trim: true, maxlength: 100 },
   description: { type: String, trim: true, maxlength: 500 },
-  configuration: { type: mongoose.Schema.Types.Mixed, required: true }
+  configuration: { type: mongoose.Schema.Types.Mixed, required: true },
+  leverage_multiplier: { type: Number, min: 0 }
 }, {
   timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }
 });

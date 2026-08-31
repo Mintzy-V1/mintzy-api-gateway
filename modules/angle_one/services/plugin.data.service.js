@@ -1045,6 +1045,24 @@ const fetchLivePnlFromPlugin = async (userId, sessionId, targetBaseUrl) => {
     return result?.data ?? result;
 };
 
+const getPyramidPnl = async (userId, sessionId) => {
+    logger.info("Fetching pyramid PnL snapshot", { userId, sessionId });
+    const ts = await mongoose.model("TradingSession").findOne({
+        python_session_id: sessionId,
+        user_id: userId
+    });
+    const targetBaseUrl = resolvePluginTargetUrl(ts);
+    const pluginRes = await forwardToPlugin(
+        `/api/trading/pyramid-pnl/${sessionId}`,
+        "get",
+        null,
+        userId ? { "X-Forwarded-User": userId.toString() } : {},
+        {},
+        { targetBaseUrl }
+    );
+    return pluginRes?.data;
+};
+
 const getLivePnl = async (userId, sessionId) => {
     logger.info("Fetching live PnL", { userId, sessionId });
 
@@ -1211,6 +1229,7 @@ export {
     restoreAuthenticatedSessionInPluginDb,
     getFullSessionState,
     fetchAllTradingLogs,
+    getPyramidPnl,
     getLivePnl,
     getLivePnlHistory,
     saveFinalPnlSnapshot,
@@ -1239,6 +1258,7 @@ export default {
     restoreAuthenticatedSessionInPluginDb,
     getFullSessionState,
     fetchAllTradingLogs,
+    getPyramidPnl,
     getLivePnl,
     getLivePnlHistory,
     saveFinalPnlSnapshot,
