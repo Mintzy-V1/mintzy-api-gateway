@@ -2,7 +2,7 @@
 
 ## Short Summary
 
-Angle One simulation starts after a user already has an authenticated broker/plugin session. When `start-simulation` is called, the gateway takes the selected saved trading configuration, converts it into a plugin-ready payload, forces it into strategy `B`, and starts a paper simulation worker on the plugin. The gateway stores the returned simulation job id and marks the session as `simulation_active`. After that, a background poller keeps watching the simulation. When the simulation finishes early, or when the configured auto-stop time arrives, the gateway stops the simulation worker, asks the plugin which symbols are suitable for live trading, and then either closes the session if there are no profitable symbols or switches the same session into live trading with strategy `C`. So the thing to remember is: strategy `B` runs the morning paper test, then stop/handoff filters the winners, and strategy `C` starts real trading only if there are winners.
+Angle One simulation starts after a user already has an authenticated broker/plugin session. When `start-simulation` is called, the gateway takes the selected saved trading configuration, converts it into a plugin-ready payload, forces it into strategy `B`, and starts a paper simulation worker on the plugin. The gateway stores the returned simulation job id, marks the session as `simulation_active`, and starts the PnL snapshot monitor immediately so simulation-phase PnL points can be saved. After that, a background poller keeps watching the simulation. When the simulation finishes early, or when the configured auto-stop time arrives, the gateway stops the simulation worker, asks the plugin which symbols are suitable for live trading, and then either closes the session if there are no profitable symbols or switches the same session into live trading with strategy `C`. So the thing to remember is: strategy `B` runs the morning paper test, PnL snapshots start from simulation, stop/handoff filters the winners, and strategy `C` starts real trading only if there are winners.
 
 ## Main Endpoints
 
@@ -22,7 +22,7 @@ The saved configuration and request overrides are merged into a plugin payload b
 
 Before starting the simulation, the gateway asks the plugin for the session status with `GET /api/session/:session_id/status`. The plugin status must be exactly `authenticated`; otherwise the simulation is rejected because the plugin start-simulation endpoint expects an authenticated session.
 
-After that, the gateway calls the plugin start-simulation endpoint, normally `POST /api/trading/start-simulation`, using the resolved plugin target URL. The plugin returns a simulation response, usually with a `job_id`. The gateway stores that job id in the session, marks the gateway session as `simulation_active`, stores `broker: "angle_one"`, records timestamps and the saved configuration id, and returns the job id and simulation status to the client.
+After that, the gateway calls the plugin start-simulation endpoint, normally `POST /api/trading/start-simulation`, using the resolved plugin target URL. The plugin returns a simulation response, usually with a `job_id`. The gateway stores that job id in the session, marks the gateway session as `simulation_active`, stores `broker: "angle_one"`, records timestamps and the saved configuration id, starts the PnL snapshot monitor, and returns the job id and simulation status to the client.
 
 ## Manual Stop Simulation Flow
 
@@ -34,7 +34,7 @@ The real work happens in `executeSimulationToLiveHandoff`. First, it calls `stop
 
 If the plugin returns `live_allowed: false`, the gateway does not start live trading. It calls `finalizeNoProfitableSymbolsSession`, marks the session as `stopped`, marks simulation as `completed`, stores the plugin stop/pyramid output, and returns a no-live response.
 
-If live trading is allowed, the gateway prepares the session for live trading. `prepareSessionForLiveTrading` checks the plugin status, resets stale `trading_active` state back to `authenticated` when needed, and updates the saved configuration strategy to `C`. Then the gateway builds a live start payload using the saved configuration and any `symbols_for_live` returned by the plugin. It calls `startTrading`, which sends `POST /api/trading/start` to the plugin. After the plugin starts live trading, the gateway marks the session as `trading_active`, starts the live PnL snapshot monitor, marks the plugin DB session as trading active, confirms live status, and finally saves simulation handoff metadata.
+If live trading is allowed, the gateway prepares the session for live trading. `prepareSessionForLiveTrading` checks the plugin status, resets stale `trading_active` state back to `authenticated` when needed, and updates the saved configuration strategy to `C`. Then the gateway builds a live start payload using the saved configuration and any `symbols_for_live` returned by the plugin. It calls `startTrading`, which sends `POST /api/trading/start` to the plugin. After the plugin starts live trading, the gateway marks the session as `trading_active`, keeps the same PnL snapshot monitor running, marks the plugin DB session as trading active, confirms live status, and finally saves simulation handoff metadata.
 
 ## Automatic Stop And Handoff
 
@@ -52,7 +52,7 @@ The poller runs every `SIMULATION_POLL_INTERVAL_MS`, default `60000` millisecond
 
 | Moment | Session State |
 | --- | --- |
-| Simulation starts | `status = "simulation_active"`, `simulation_status = "running"` or mapped plugin status, `simulation_job_id` saved. |
+| Simulation starts | `status = "simulation_active"`, `simulation_status = "running"` or mapped plugin status, `simulation_job_id` saved, PnL monitor starts. |
 | Simulation is still running | Poller keeps refreshing `simulation_status`. |
 | Simulation fails externally | `simulation_status = "failed"`, external job result saved. |
 | Simulation finishes with no winners | `status = "stopped"`, `simulation_status = "completed"`, no live trading. |
@@ -164,7 +164,7 @@ File: `modules/angle_one/controllers/plugin.controller.js`
 | `checkMarketHours` | Checks whether current IST time is before market close; currently not enforced in this service. |
 | `submitCredentials` | Sends Angle One credentials to plugin and creates/updates gateway session. |
 | `verifyTotp` | Sends TOTP to plugin and marks gateway session authenticated. |
-| `startTrading` | Starts live trading through plugin, updates session, starts live PnL monitor. |
+| `startTrading` | Starts live trading through plugin, updates session, and ensures the PnL monitor is running. |
 | `stopSimulationTrading` | Stops the plugin simulation worker with one retry for transient failures. |
 | `stopTrading` | Stops live trading and marks gateway/plugin state stopped. |
 | `stopTradingSymbol` | Exits one symbol from a live trading session. |
@@ -210,8 +210,8 @@ File: `modules/angle_one/controllers/plugin.controller.js`
 | `getLivePnlCollection` | Ensures and returns the live PnL history collection. |
 | `toNumber` | Converts values to numbers with fallback. |
 | `getSourceDateFromLivePnlData` | Finds the best date field from live PnL data. |
-| `saveLivePnlSnapshot` | Saves one normalized live PnL snapshot. |
-| `normalizeLivePnlSnapshot` | Normalizes raw live PnL snapshot values. |
+| `saveLivePnlSnapshot` | Saves one normalized PnL snapshot with `simulation` or `live` phase. |
+| `normalizeLivePnlSnapshot` | Normalizes raw PnL snapshot values for history responses. |
 | `buildMonthDateKeys` | Builds all date keys for a month. |
 | `buildEmptyDailyFinalPnl` | Creates zero-value daily PnL rows for a month. |
 | `resolveSymbolPnl` | Extracts PnL for one symbol/log row. |
@@ -245,9 +245,9 @@ File: `modules/angle_one/controllers/plugin.controller.js`
 | `getLivePnl` | Gets current live PnL through plugin. |
 | `stopLivePnlSnapshotMonitor` | Stops live PnL interval for a session. |
 | `stopAllLivePnlSnapshotMonitors` | Stops all live PnL intervals. |
-| `runLivePnlSnapshotTick` | One live PnL polling/saving tick. |
-| `startLivePnlSnapshotMonitor` | Starts periodic live PnL snapshot saving. |
-| `resumeLivePnlSnapshotMonitors` | Restarts live PnL monitors for active sessions after boot. |
+| `runLivePnlSnapshotTick` | One PnL polling/saving tick while session is simulation or live. |
+| `startLivePnlSnapshotMonitor` | Starts periodic PnL snapshot saving. |
+| `resumeLivePnlSnapshotMonitors` | Restarts PnL monitors for simulation/live sessions after boot if called. |
 | `getLivePnlHistory` | Reads saved live PnL history for a date. |
 
 ### `plugin.admin.service.js`

@@ -16,11 +16,12 @@ const tradingSessionSchema = new mongoose.Schema({
   simulation_job_id: { type: String },
   simulation_status: {
     type: String,
-    enum: ['pending', 'running', 'started', 'completed', 'failed', 'handoff_in_progress'],
+    enum: ['pending', 'running', 'started', 'completed', 'failed', 'handoff_in_progress', 'handoff_failed', 'cancelling', 'cancelled'],
     default: undefined
   },
   simulation_started_at: { type: Date },
   simulation_completed_at: { type: Date },
+  simulation_cancel_requested: { type: Boolean, default: false },
   simulation_live_switch_triggered: { type: Boolean, default: false },
   simulation_live_started_at: { type: Date },
   simulation_trade_date: { type: String },
