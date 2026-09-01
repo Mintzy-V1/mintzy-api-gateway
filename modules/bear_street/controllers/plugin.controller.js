@@ -157,7 +157,7 @@ const getActiveSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     const session = await TradingSession.findOne({
         user_id: userId,
-        status: { $in: ["credentials_received", "authenticated", "trading_active"] }
+        status: { $in: ["credentials_received", "authenticated", "simulation_active", "trading_active"] }
     }).sort({ created_at: -1 });
 
     if (!session) {
