@@ -289,6 +289,10 @@ const startTrading = async (userId, payload = {}) => {
     const targetBaseUrl = resolvePluginTargetUrl(ts);
     let savedConfiguration = null;
 
+    if (ts?.simulation_cancel_requested || ["cancelling", "cancelled"].includes(ts?.simulation_status)) {
+        throw new AppError("Simulation was cancelled by user. Live trading will not start for this session.", 409);
+    }
+
     const resolvedSavedConfigurationId =
         saved_configuration_id
         || ts?.saved_configuration_id?.toString()
@@ -465,10 +469,44 @@ const stopSimulationTrading = async (userId, sessionId) => {
 const stopTrading = async (userId, sessionId) => {
     logger.info("Stopping TradeX session", { userId, sessionId });
 
-    const ts = await TradingSession.findOne({ python_session_id: sessionId });
+    const cancellationTime = new Date();
+    let ts = await TradingSession.findOneAndUpdate(
+        {
+            python_session_id: sessionId,
+            user_id: userId,
+            status: "simulation_active",
+            simulation_cancel_requested: { $ne: true }
+        },
+        {
+            $set: {
+                status: "stopped",
+                simulation_status: "cancelled",
+                simulation_cancel_requested: true,
+                simulation_live_switch_triggered: false,
+                simulation_completed_at: cancellationTime,
+                ended_at: cancellationTime,
+                "simulation_output.cancelled_by_user": true,
+                "simulation_output.cancelled_at": cancellationTime,
+                "simulation_output.cancel_source": "stop_endpoint"
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    const wasSimulationCancelled = Boolean(ts);
+
+    if (!ts) {
+        ts = await TradingSession.findOne({ python_session_id: sessionId, user_id: userId });
+    }
+
+    const isSimulationCancellationResult =
+        wasSimulationCancelled
+        || Boolean(ts?.simulation_cancel_requested || ["cancelling", "cancelled"].includes(ts?.simulation_status));
+
     const targetBaseUrl = resolvePluginTargetUrl(ts);
 
     let pluginRes = null;
+    let pluginStopError = null;
     try {
         pluginRes = await forwardToPlugin(
             `/api/trading/stop/${sessionId}`,
@@ -479,6 +517,10 @@ const stopTrading = async (userId, sessionId) => {
             { targetBaseUrl }
         );
     } catch (err) {
+        pluginStopError = {
+            message: err.message,
+            statusCode: err.statusCode || err.response?.status || null
+        };
         logger.warn("Plugin stop request failed; marking session stopped locally", {
             sessionId,
             error: err.message
@@ -486,15 +528,44 @@ const stopTrading = async (userId, sessionId) => {
     }
 
     if (ts) {
-        ts.status = "stopped";
-        ts.ended_at = new Date();
-        await ts.save();
+        const stopPayload = pluginRes?.data || {
+            success: true,
+            session_id: sessionId,
+            worker_stopped: false,
+            plugin_stop_error: pluginStopError
+        };
+
+        if (isSimulationCancellationResult) {
+            await TradingSession.findByIdAndUpdate(ts._id, {
+                $set: {
+                    "simulation_output.stop": stopPayload,
+                    "simulation_output.live_allowed": false
+                }
+            });
+        } else {
+            ts.status = "stopped";
+            ts.ended_at = new Date();
+            await ts.save();
+        }
+
         dataService.stopLivePnlSnapshotMonitor(sessionId, ts.user_id);
     }
 
     await dataService.markPluginSessionStopped(sessionId).catch((err) =>
         logger.warn("Failed to sync plugin_sessions stopped status", { sessionId, error: err.message })
     );
+
+    if (isSimulationCancellationResult) {
+        return {
+            ...(pluginRes?.data || { success: true, session_id: sessionId, worker_stopped: false, plugin_stop_error: pluginStopError }),
+            session_id: sessionId,
+            status: "stopped",
+            simulation_status: "cancelled",
+            cancelled: true,
+            live_allowed: false,
+            message: "Simulation cancelled by user. Live trading will not start for this session."
+        };
+    }
 
     return pluginRes?.data || { success: true, session_id: sessionId, worker_stopped: false };
 };

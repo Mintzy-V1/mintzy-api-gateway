@@ -143,7 +143,8 @@ const getTradingLogsDebugView = async (sessionId, options = {}) => {
 
 const DATE_TIMEZONE = 'Asia/Kolkata';
 const LIVE_PNL_HISTORY_LIMIT = 300;
-const LIVE_PNL_SAVE_INTERVAL_MS = 30000;
+const LIVE_PNL_SAVE_INTERVAL_MS = 1000;
+const LIVE_PNL_SNAPSHOT_STATUSES = new Set(['simulation_active', 'trading_active']);
 
 const getDateKeyFromTimestamp = (timestamp) => {
     const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
@@ -190,7 +191,7 @@ const getSourceDateFromLivePnlData = (data) => {
     return new Date();
 };
 
-const saveLivePnlSnapshot = async (userId, sessionId, pluginResponse) => {
+const saveLivePnlSnapshot = async (userId, sessionId, pluginResponse, phase = 'live') => {
     try {
         const ready = pluginResponse?.ready ?? false;
         const data = pluginResponse?.data ?? null;
@@ -208,12 +209,13 @@ const saveLivePnlSnapshot = async (userId, sessionId, pluginResponse) => {
         const sourceDate = getSourceDateFromLivePnlData(data);
         const marketDate = getDateKeyFromTimestamp(sourceDate) || getDateKeyFromTimestamp(sampledAt);
         const sourceBucket = Math.floor(sourceDate.getTime() / LIVE_PNL_SAVE_INTERVAL_MS) * LIVE_PNL_SAVE_INTERVAL_MS;
-        const sourceKey = String(sourceBucket);
+        const sourceKey = `${phase}:${sourceBucket}`;
         const userIdValue = userId?.toString();
 
         const doc = {
             session_id: sessionId,
             user_id: userIdValue,
+            phase,
             market_date: marketDate,
             source_key: sourceKey,
             source_ts: data.ts ?? null,
@@ -249,6 +251,7 @@ const normalizeLivePnlSnapshot = (snapshot) => {
         sampled_at: snapshot.sampled_at,
         source_ts: snapshot.source_ts,
         market_date: snapshot.market_date,
+        phase: snapshot.phase || rawData.phase || null,
         data: {
             realized_pnl: toNumber(snapshot.realized_pnl),
             live_unrealized_pnl: toNumber(snapshot.live_unrealized_pnl),
@@ -1102,13 +1105,14 @@ const runLivePnlSnapshotTick = async (key) => {
             user_id: monitor.userId
         });
 
-        if (!ts || ts.status !== 'trading_active') {
+        if (!ts || !LIVE_PNL_SNAPSHOT_STATUSES.has(ts.status)) {
             stopLivePnlSnapshotMonitor(monitor.sessionId, monitor.userId);
             return;
         }
 
+        const phase = ts.status === 'simulation_active' ? 'simulation' : 'live';
         const pluginResponse = await fetchLivePnlFromPlugin(monitor.userId, monitor.sessionId, resolvePluginTargetUrl(ts));
-        await saveLivePnlSnapshot(monitor.userId, monitor.sessionId, pluginResponse);
+        await saveLivePnlSnapshot(monitor.userId, monitor.sessionId, pluginResponse, phase);
     } catch (err) {
         logger.warn('Live PnL snapshot monitor tick failed', {
             sessionId: monitor.sessionId,
@@ -1145,7 +1149,7 @@ const startLivePnlSnapshotMonitor = (userId, sessionId) => {
 
 const resumeLivePnlSnapshotMonitors = async () => {
     const sessions = await mongoose.model('TradingSession')
-        .find({ status: 'trading_active', python_session_id: { $exists: true, $ne: null } })
+        .find({ status: { $in: ['simulation_active', 'trading_active'] }, python_session_id: { $exists: true, $ne: null } })
         .select('user_id python_session_id')
         .lean();
 

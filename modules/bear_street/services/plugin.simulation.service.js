@@ -32,9 +32,33 @@ const SIMULATION_AUTO_STOP_MINUTE_IST = parseInt(process.env.SIMULATION_AUTO_STO
 const SIMULATION_REQUEST_TIMEOUT = parseInt(process.env.SIMULATION_REQUEST_TIMEOUT || "60000", 10);
 
 const ACTIVE_SIMULATION_STATUSES = ["pending", "running", "started"];
+const CANCELLED_SIMULATION_STATUSES = ["cancelling", "cancelled"];
 let pollerStarted = false;
 let pollInProgress = false;
 let lastAutoStopDateKey = null;
+
+const isSimulationCancellationRequested = (session) =>
+    Boolean(
+        session
+        && (
+            session.simulation_cancel_requested
+            || session.status === "stopped"
+            || CANCELLED_SIMULATION_STATUSES.includes(session.simulation_status)
+        )
+    );
+
+const buildSimulationCancelledResponse = (sessionId, session = null) => ({
+    session_id: sessionId,
+    configuration_id: session?.saved_configuration_id?.toString?.() || null,
+    saved_configuration_id: session?.saved_configuration_id?.toString?.() || null,
+    stop: null,
+    live_trading: null,
+    status: session?.status || "stopped",
+    simulation_status: session?.simulation_status || "cancelled",
+    cancelled: true,
+    live_allowed: false,
+    message: "Simulation was cancelled by user. Live trading will not start for this session."
+});
 
 const getIstDateParts = (date = new Date()) => {
     const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -446,6 +470,7 @@ const startSimulation = async (userId, payload = {}) => {
     ts.simulation_status = mapExternalSimulationStatus(simResponse?.status || "started");
     ts.simulation_started_at = new Date();
     ts.simulation_completed_at = undefined;
+    ts.simulation_cancel_requested = false;
     ts.simulation_live_switch_triggered = false;
     ts.simulation_live_started_at = undefined;
     ts.simulation_trade_date = trade_date;
@@ -454,6 +479,7 @@ const startSimulation = async (userId, payload = {}) => {
     ts.configuration_name = savedConfiguration.name;
     ts.trading_configuration = mergedConfiguration;
     await ts.save();
+    dataService.startLivePnlSnapshotMonitor(ts.user_id, ts.python_session_id);
 
     logSimGwTiming("startSimulation EXIT success", {
         session_id,
@@ -547,6 +573,11 @@ const applySimulationOutputAndStartLive = async (session, jobResult = null) => {
     const userId = session.user_id?.toString();
     const savedConfigurationId = session.saved_configuration_id;
 
+    const latestSession = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSession)) {
+        return buildSimulationCancelledResponse(session.python_session_id, latestSession);
+    }
+
     if (!savedConfigurationId) {
         throw new AppError("Session is missing saved_configuration_id for live handoff", 500);
     }
@@ -601,6 +632,11 @@ const applySimulationOutputAndStartLive = async (session, jobResult = null) => {
     try {
         handoffResult = await executeSimulationToLiveHandoff(userId, session);
     } catch (err) {
+        const latestSession = await TradingSession.findById(session._id).lean();
+        if (isSimulationCancellationRequested(latestSession)) {
+            return buildSimulationCancelledResponse(session.python_session_id, latestSession);
+        }
+
         session.simulation_live_switch_triggered = false;
         session.simulation_status = "handoff_failed";
         await session.save().catch(() => {});
@@ -749,6 +785,10 @@ const executeSimulationToLiveHandoff = async (userId, session) => {
         throw new AppError(stopResponse?.message || "Failed to stop simulation session", 502);
     }
 
+    const symbolsForLive = Array.isArray(stopResponse?.pyramid?.symbols_for_live)
+        ? stopResponse.pyramid.symbols_for_live.filter((entry) => entry?.symbol && Number(entry?.capital) > 0)
+        : [];
+
     if (stopResponse?.live_allowed === false) {
         logSimGwTiming("executeSimulationToLiveHandoff blocked — no profitable symbols", {
             session_id,
@@ -763,19 +803,67 @@ const executeSimulationToLiveHandoff = async (userId, session) => {
         };
     }
 
-    logSimGwTiming("executeSimulationToLiveHandoff trusting stop-simulation response", {
+    if (stopResponse?.live_allowed !== true || symbolsForLive.length === 0) {
+        const blockedReason = stopResponse?.live_allowed !== true
+            ? "live_not_explicitly_allowed"
+            : "missing_symbols_for_live";
+        const pyramidReason = stopResponse?.pyramid?.reason || stopResponse?.stopped_reason || blockedReason;
+        const guardedStopResponse = {
+            ...(stopResponse || {}),
+            live_allowed: false,
+            stopped_reason: pyramidReason,
+            message: "Simulation stopped. Live trading blocked because stop-simulation did not return valid live symbols.",
+            pyramid: {
+                ...(stopResponse?.pyramid || {}),
+                live_allowed: false,
+                reason: pyramidReason,
+                symbols_for_live: symbolsForLive
+            }
+        };
+
+        logSimGwTiming("executeSimulationToLiveHandoff blocked - invalid live handoff payload", {
+            session_id,
+            plugin_live_allowed: stopResponse?.live_allowed ?? null,
+            pyramid_reason: pyramidReason,
+            symbols_for_live_count: symbolsForLive.length
+        });
+
+        await dataService.markPluginSessionStopped(session_id, {
+            trading_status: "stopped"
+        }).catch((err) => {
+            logger.warn("Failed to mark plugin session stopped after invalid live handoff payload", {
+                sessionId: session_id,
+                error: err.message
+            });
+        });
+
+        const noLiveResult = await finalizeNoProfitableSymbolsSession(session, guardedStopResponse);
+        return {
+            stopResponse: guardedStopResponse,
+            liveStartResult: null,
+            noLiveResult
+        };
+    }
+
+    logSimGwTiming("executeSimulationToLiveHandoff validated stop-simulation response", {
         session_id,
         trading_status: stopResponse?.trading_status ?? null,
         configuration_id: stopResponse?.configuration_id ?? session.saved_configuration_id?.toString(),
         pluginTimingMs: stopResponse?.timing_ms ?? null,
-        note: "post-stop worker/auth polling disabled — plugin stop is blocking and authoritative"
+        symbols_for_live_count: symbolsForLive.length,
+        note: "live start requires explicit live_allowed true and at least one valid pyramid symbol"
     });
 
-    await prepareSessionForLiveTrading(userId, session);
+    const latestSessionBeforeLive = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSessionBeforeLive)) {
+        return {
+            stopResponse,
+            liveStartResult: null,
+            noLiveResult: buildSimulationCancelledResponse(session_id, latestSessionBeforeLive)
+        };
+    }
 
-    const symbolsForLive = Array.isArray(stopResponse?.pyramid?.symbols_for_live)
-        ? stopResponse.pyramid.symbols_for_live.filter((entry) => entry?.symbol && Number(entry?.capital) > 0)
-        : [];
+    await prepareSessionForLiveTrading(userId, session);
 
     const liveStartPayload = {
         session_id,
@@ -886,6 +974,11 @@ const prepareSessionForLiveTrading = async (userId, session) => {
         }
     }
 
+    const latestSessionBeforeStrategyUpdate = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSessionBeforeStrategyUpdate)) {
+        throw new AppError("Simulation was cancelled by user. Live trading will not start for this session.", 409);
+    }
+
     await updateSavedConfigurationStrategyForLive(session.saved_configuration_id);
 
     console.log("[SIM-HANDOFF-DEBUG] prepareSessionForLiveTrading END", {
@@ -913,7 +1006,7 @@ const stopSimulation = async (userId, payload = {}) => {
         throw new AppError("session_id is required", 400);
     }
 
-    const session = await TradingSession.findOne({
+    let session = await TradingSession.findOne({
         python_session_id: session_id,
         user_id: userId
     });
@@ -923,12 +1016,25 @@ const stopSimulation = async (userId, payload = {}) => {
         throw new AppError("Trading session not found", 404);
     }
 
+    if (isSimulationCancellationRequested(session)) {
+        console.log("[SIM-HANDOFF-DEBUG] stopSimulation SKIP - simulation cancelled/stopped", {
+            session_id,
+            gatewayStatus: session.status,
+            simulation_status: session.simulation_status
+        });
+        return buildSimulationCancelledResponse(session_id, session);
+    }
+
     if (!session.saved_configuration_id) {
         console.log("[SIM-HANDOFF-DEBUG] stopSimulation ABORT — missing saved_configuration_id", { session_id });
         throw new AppError("saved_configuration_id is missing on this session", 400);
     }
 
     if (session.simulation_live_switch_triggered) {
+        if (session.simulation_status === "handoff_in_progress") {
+            throw new AppError("Simulation live handoff is already in progress", 409);
+        }
+
         const liveConfirmed = await isLiveTradingConfirmed(userId, session);
 
         if (liveConfirmed) {
@@ -943,6 +1049,40 @@ const stopSimulation = async (userId, payload = {}) => {
         session.simulation_live_switch_triggered = false;
         await session.save();
     }
+
+    const handoffSession = await TradingSession.findOneAndUpdate(
+        {
+            _id: session._id,
+            status: "simulation_active",
+            simulation_cancel_requested: { $ne: true },
+            simulation_live_switch_triggered: { $ne: true },
+            simulation_status: { $nin: ["handoff_in_progress", ...CANCELLED_SIMULATION_STATUSES] }
+        },
+        {
+            $set: {
+                simulation_status: "handoff_in_progress",
+                simulation_live_switch_triggered: true
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    if (!handoffSession) {
+        const latestSession = await TradingSession.findById(session._id).lean();
+
+        if (isSimulationCancellationRequested(latestSession)) {
+            console.log("[SIM-HANDOFF-DEBUG] stopSimulation SKIP after lock - simulation cancelled/stopped", {
+                session_id,
+                gatewayStatus: latestSession?.status,
+                simulation_status: latestSession?.simulation_status
+            });
+            return buildSimulationCancelledResponse(session_id, latestSession);
+        }
+
+        throw new AppError("Simulation live handoff is already in progress or session is not active", 409);
+    }
+
+    session = handoffSession;
 
     console.log("[SIM-HANDOFF-DEBUG] stopSimulation session loaded", {
         session_id,
@@ -959,6 +1099,11 @@ const stopSimulation = async (userId, payload = {}) => {
     try {
         handoffResult = await executeSimulationToLiveHandoff(userId, session);
     } catch (err) {
+        const latestSession = await TradingSession.findById(session._id).lean();
+        if (isSimulationCancellationRequested(latestSession)) {
+            return buildSimulationCancelledResponse(session_id, latestSession);
+        }
+
         session.simulation_live_switch_triggered = false;
         session.simulation_status = "handoff_failed";
         await session.save().catch(() => {});
@@ -1023,6 +1168,10 @@ const processSimulationSession = async (session) => {
         return;
     }
 
+    if (isSimulationCancellationRequested(session)) {
+        return;
+    }
+
     if (session.simulation_live_switch_triggered) {
         const liveConfirmed = await isLiveTradingConfirmed(session.user_id?.toString(), session);
 
@@ -1061,7 +1210,10 @@ const processSimulationSession = async (session) => {
     const lockedSession = await TradingSession.findOneAndUpdate(
         {
             _id: session._id,
+            status: "simulation_active",
+            simulation_cancel_requested: { $ne: true },
             simulation_live_switch_triggered: { $ne: true },
+            simulation_status: { $nin: CANCELLED_SIMULATION_STATUSES },
             simulation_job_id: session.simulation_job_id
         },
         { $set: { simulation_status: "handoff_in_progress" } },
@@ -1108,6 +1260,7 @@ const pollDueSimulationJobs = async () => {
         const sessions = await TradingSession.find({
             broker: BROKER_KEY,
             status: "simulation_active",
+            simulation_cancel_requested: { $ne: true },
             simulation_live_switch_triggered: { $ne: true },
             simulation_job_id: { $exists: true, $ne: null },
             simulation_status: { $in: ACTIVE_SIMULATION_STATUSES }
@@ -1158,6 +1311,8 @@ const autoStopDueSimulations = async () => {
     const sessions = await TradingSession.find({
         broker: BROKER_KEY,
         status: "simulation_active",
+        simulation_cancel_requested: { $ne: true },
+        simulation_status: { $nin: ["handoff_in_progress", ...CANCELLED_SIMULATION_STATUSES] },
         simulation_trade_date: today
     }).sort({ simulation_started_at: 1 });
 
