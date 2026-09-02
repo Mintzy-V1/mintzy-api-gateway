@@ -430,6 +430,14 @@ const getLivePnlHistory = catchAsync(async (req, res) => {
     });
 });
 
+const getExitedSymbols = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const sessionId = req.params.sessionId || req.params.session_id;
+    const result = await dataService.getExitedSymbols(userId, sessionId);
+
+    res.status(200).json(result);
+});
+
 const getTradingLogs = catchAsync(async (req, res) => {
     const { sessionId } = req.params;
     const logs = await dataService.getTradingLogs(sessionId);
@@ -677,6 +685,7 @@ export default {
     getTradingSnapshot,
     getLivePnl,
     getLivePnlHistory,
+    getExitedSymbols,
     getTradingLogs,
     downloadTradingLogs,
     downloadFinalTradebook,

@@ -142,8 +142,9 @@ const getTradingLogsDebugView = async (sessionId, options = {}) => {
 };
 
 const DATE_TIMEZONE = 'Asia/Kolkata';
-const LIVE_PNL_HISTORY_LIMIT = 300;
 const LIVE_PNL_SAVE_INTERVAL_MS = 1000;
+const LIVE_PNL_REQUEST_STOP_HOUR_IST = parseInt(process.env.LIVE_PNL_REQUEST_STOP_HOUR_IST || "15", 10);
+const LIVE_PNL_REQUEST_STOP_MINUTE_IST = parseInt(process.env.LIVE_PNL_REQUEST_STOP_MINUTE_IST || "5", 10);
 const LIVE_PNL_SNAPSHOT_STATUSES = new Set(['simulation_active', 'trading_active']);
 
 const getDateKeyFromTimestamp = (timestamp) => {
@@ -151,6 +152,24 @@ const getDateKeyFromTimestamp = (timestamp) => {
     if (Number.isNaN(date.getTime())) return null;
     return date.toLocaleDateString('en-CA', { timeZone: DATE_TIMEZONE });
 };
+
+const getIstMinutesSinceMidnight = (date = new Date()) => {
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+        timeZone: DATE_TIMEZONE,
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+    });
+    const parts = formatter.formatToParts(date);
+    const lookup = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+    return (Number(lookup.hour) * 60) + Number(lookup.minute);
+};
+
+const getLivePnlRequestStopMinutesSinceMidnight = () =>
+    (LIVE_PNL_REQUEST_STOP_HOUR_IST * 60) + LIVE_PNL_REQUEST_STOP_MINUTE_IST;
+
+const isLivePnlRequestCutoffDue = (date = new Date()) =>
+    getIstMinutesSinceMidnight(date) >= getLivePnlRequestStopMinutesSinceMidnight();
 
 let livePnlIndexesReady = false;
 const livePnlLastSavedAt = new Map();
@@ -1097,6 +1116,16 @@ const runLivePnlSnapshotTick = async (key) => {
     const monitor = livePnlSnapshotMonitors.get(key);
     if (!monitor || monitor.running) return;
 
+    if (isLivePnlRequestCutoffDue()) {
+        stopLivePnlSnapshotMonitor(monitor.sessionId, monitor.userId);
+        logger.info('Stopped live PnL snapshot monitor after IST cutoff', {
+            sessionId: monitor.sessionId,
+            userId: monitor.userId?.toString(),
+            stopAtIst: `${LIVE_PNL_REQUEST_STOP_HOUR_IST}:${String(LIVE_PNL_REQUEST_STOP_MINUTE_IST).padStart(2, '0')}`
+        });
+        return;
+    }
+
     monitor.running = true;
 
     try {
@@ -1127,6 +1156,15 @@ const runLivePnlSnapshotTick = async (key) => {
 
 const startLivePnlSnapshotMonitor = (userId, sessionId) => {
     if (!userId || !sessionId) return false;
+
+    if (isLivePnlRequestCutoffDue()) {
+        logger.info('Skipped live PnL snapshot monitor start after IST cutoff', {
+            sessionId,
+            userId: userId.toString(),
+            stopAtIst: `${LIVE_PNL_REQUEST_STOP_HOUR_IST}:${String(LIVE_PNL_REQUEST_STOP_MINUTE_IST).padStart(2, '0')}`
+        });
+        return false;
+    }
 
     const key = getLivePnlMonitorKey(userId, sessionId);
     if (livePnlSnapshotMonitors.has(key)) return true;
@@ -1187,7 +1225,6 @@ const getLivePnlHistory = async (userId, sessionId, marketDate) => {
         .find({ session_id: sessionId, user_id: userIdValue, market_date: targetMarketDate })
         .project({ _id: 0 })
         .sort({ source_time: -1, sampled_at: -1 })
-        .limit(LIVE_PNL_HISTORY_LIMIT)
         .toArray();
 
     return {
@@ -1239,6 +1276,12 @@ const getTradingSnapshot = async (sessionId, userId) => {
 const getPyramidPnl = async (sessionId, userId) => {
     logger.info("Fetching Bear Street pyramid PnL snapshot", { sessionId, userId });
     const pluginRes = await proxyGet(`/api/trading/pyramid-pnl/${sessionId}`, { sessionId, userId });
+    return pluginRes?.data;
+};
+
+const getExitedSymbols = async (userId, sessionId) => {
+    logger.info("Fetching Bear Street exited symbols", { userId, sessionId });
+    const pluginRes = await proxyGet(`/api/trading/exited-symbols/${sessionId}`, { sessionId, userId });
     return pluginRes?.data;
 };
 
@@ -1330,6 +1373,7 @@ export {
     getSessionStatus,
     getTradingSnapshot,
     getPyramidPnl,
+    getExitedSymbols,
     getTradingLogs,
     downloadTradingLogs,
     getAdminTradingLogs,
@@ -1368,6 +1412,7 @@ export default {
     getSessionStatus,
     getTradingSnapshot,
     getPyramidPnl,
+    getExitedSymbols,
     getTradingLogs,
     downloadTradingLogs,
     getAdminTradingLogs,

@@ -741,6 +741,17 @@ const getLivePnlHistory = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc Get exited symbols for a trading session
+ */
+const getExitedSymbols = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const sessionId = req.params.sessionId || req.params.session_id;
+    const result = await dataService.getExitedSymbols(userId, sessionId);
+
+    res.status(200).json(result);
+});
+
+/**
  * @desc [DEBUG] Mark a plugin DB session as stopped without auth/validation
  */
 const debugStopPluginSession = catchAsync(async (req, res) => {
@@ -820,6 +831,7 @@ export {
     stopSymbol,
     getLivePnl,
     getLivePnlHistory,
+    getExitedSymbols,
     testFinalPnl,
     debugTradingLogs,
     debugStopPluginSession
@@ -868,6 +880,7 @@ export default {
     stopSymbol,
     getLivePnl,
     getLivePnlHistory,
+    getExitedSymbols,
     testFinalPnl,
     debugTradingLogs,
     debugStopPluginSession
