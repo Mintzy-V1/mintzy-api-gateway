@@ -87,6 +87,11 @@ router.get('/trading/live-pnl/:session_id/history',
   pluginController.getLivePnlHistory
 );
 
+router.get('/trading/exited-symbols/:session_id',
+  validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
+  pluginController.getExitedSymbols
+);
+
 router.post("/trading/:sessionId/abandon",
   validateRequest(pluginValidation.sessionIdParamSchema, 'params'),
   pluginController.abandonSession

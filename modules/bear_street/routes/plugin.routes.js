@@ -103,6 +103,12 @@ router.get("/trading/live-pnl/:sessionId",
     pluginController.getLivePnl
 );
 
+router.get("/trading/exited-symbols/:sessionId",
+    authMiddleware,
+    validateRequest(pluginValidation.sessionIdParamSchema, "params"),
+    pluginController.getExitedSymbols
+);
+
 router.post("/trading/:sessionId/abandon",
     authMiddleware,
     validateRequest(pluginValidation.sessionIdParamSchema, "params"),

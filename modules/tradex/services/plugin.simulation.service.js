@@ -60,6 +60,88 @@ const buildSimulationCancelledResponse = (sessionId, session = null) => ({
     message: "Simulation was cancelled by user. Live trading will not start for this session."
 });
 
+const getStopSimulationFailureStatusCode = (err) => {
+    const statusCode = Number(err?.statusCode || err?.response?.status || err?.details?.statusCode || err?.details?.status);
+    return Number.isFinite(statusCode) ? statusCode : null;
+};
+
+const isStopSimulationVmUnavailableError = (err) => {
+    const statusCode = getStopSimulationFailureStatusCode(err);
+    if ([502, 503, 504].includes(statusCode)) return true;
+
+    const message = String(err?.message || err?.cause?.message || "").toLowerCase();
+    return (
+        message.includes("timeout")
+        || message.includes("timed out")
+        || message.includes("fetch failed")
+        || message.includes("network")
+        || message.includes("econnrefused")
+        || message.includes("econnreset")
+        || message.includes("socket hang up")
+    );
+};
+
+const failClosedStopSimulation = async (session, err) => {
+    const stoppedAt = new Date();
+    const sessionId = session.python_session_id;
+    const statusCode = getStopSimulationFailureStatusCode(err);
+    const details = err?.details || err?.response?.data || null;
+
+    await TradingSession.findByIdAndUpdate(session._id, {
+        $set: {
+            status: "stopped",
+            simulation_status: "stop_failed_vm_unavailable",
+            simulation_cancel_requested: true,
+            simulation_live_switch_triggered: false,
+            simulation_completed_at: stoppedAt,
+            ended_at: stoppedAt,
+            simulation_output: {
+                stop_error: {
+                    message: err?.message || "Plugin VM unavailable during stop-simulation",
+                    statusCode,
+                    details
+                },
+                live_allowed: false,
+                live_trading: null,
+                fail_closed: true
+            }
+        }
+    });
+
+    dataService.stopLivePnlSnapshotMonitor(sessionId, session.user_id);
+    await dataService.markPluginSessionStopped(sessionId, {
+        stopped_at: stoppedAt,
+        trading_status: "stopped",
+        reason: "stop_simulation_vm_unavailable"
+    }).catch((markErr) => {
+        logger.warn("Failed to mark plugin session stopped after VM unavailable stop-simulation", {
+            sessionId,
+            error: markErr.message
+        });
+    });
+
+    logger.error("Stop-simulation failed closed because plugin VM was unavailable", {
+        sessionId,
+        userId: session.user_id?.toString(),
+        statusCode,
+        error: err?.message
+    });
+
+    return {
+        success: false,
+        session_id: sessionId,
+        configuration_id: session.saved_configuration_id?.toString?.() || null,
+        saved_configuration_id: session.saved_configuration_id?.toString?.() || null,
+        stop: null,
+        live_trading: null,
+        status: "stopped",
+        simulation_status: "stop_failed_vm_unavailable",
+        live_allowed: false,
+        fail_closed: true,
+        message: "Plugin VM was unavailable during stop-simulation. Gateway marked this session stopped and live trading will not start."
+    };
+};
+
 const getIstDateParts = (date = new Date()) => {
     const formatter = new Intl.DateTimeFormat("en-CA", {
         timeZone: DATE_TIMEZONE,
@@ -637,6 +719,10 @@ const applySimulationOutputAndStartLive = async (session, jobResult = null) => {
             return buildSimulationCancelledResponse(session.python_session_id, latestSession);
         }
 
+        if (isStopSimulationVmUnavailableError(err)) {
+            return failClosedStopSimulation(session, err);
+        }
+
         session.simulation_live_switch_triggered = false;
         session.simulation_status = "handoff_failed";
         await session.save().catch(() => {});
@@ -1059,6 +1145,10 @@ const stopSimulation = async (userId, payload = {}) => {
         const latestSession = await TradingSession.findById(session._id).lean();
         if (isSimulationCancellationRequested(latestSession)) {
             return buildSimulationCancelledResponse(session_id, latestSession);
+        }
+
+        if (isStopSimulationVmUnavailableError(err)) {
+            return failClosedStopSimulation(session, err);
         }
 
         session.simulation_live_switch_triggered = false;
