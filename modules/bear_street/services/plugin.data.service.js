@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import "../../../models/tradingSession.js";
 import { forwardToPlugin, PLUGIN_BASE, resolvePluginTargetUrl } from "./plugin.proxy.service.js";
 import logger from "../config/logger.js";
+import * as httpCache from "../../../utils/httpCache.js";
 
 const escapeCsvValue = (value) => {
     if (value === null || value === undefined) return "";
@@ -44,8 +45,21 @@ const fetchAllTradingLogs = async () => {
  * Fetch trading logs from the specialized plugin DB
  */
 const fetchTradingLogs = async (sessionId) => {
-    const db = getPluginDb();
-    const collection = db.collection("trading_logs");
+    return httpCache.run(`logs:${sessionId}`, 10000, () => fetchTradingLogsUncached(sessionId));
+};
+
+let tradingLogsIndexesReady = false;
+
+const ensureTradingLogsIndexes = async () => {
+    if (tradingLogsIndexesReady) return;
+    const collection = getPluginDb().collection("trading_logs");
+    await collection.createIndex({ session_id: 1, timestamp: 1 }, { background: true });
+    tradingLogsIndexesReady = true;
+};
+
+const fetchTradingLogsUncached = async (sessionId) => {
+    const collection = getPluginDb().collection("trading_logs");
+    await ensureTradingLogsIndexes();
 
     return await collection
         .find({ session_id: sessionId })
@@ -277,8 +291,7 @@ const normalizeLivePnlSnapshot = (snapshot) => {
             total_pnl: toNumber(snapshot.total_pnl),
             symbols: snapshot.symbols || rawData.symbols || {},
             ts: snapshot.source_ts ?? rawData.ts ?? null
-        },
-        raw_response: snapshot.raw_response || null
+        }
     };
 };
 
@@ -528,17 +541,47 @@ const fetchTradingLogsBySessionIds = async (sessionIds, endDate) => {
 
     return await collection
         .find(filter)
-        .project({ _id: 0 })
+        // Only the fields the PnL computation reads — cuts the payload several
+        // times over for users with many sessions.
+        .project({
+            _id: 0,
+            session_id: 1,
+            timestamp: 1,
+            cycle: 1,
+            symbol: 1,
+            final_pnl: 1,
+            symbol_pnl: 1,
+            pnl: 1,
+            realized_pnl: 1,
+            unrealized_pnl: 1,
+            total_equity: 1,
+            cash_balance: 1,
+            portfolio_cash_balance: 1,
+            portfolio_realized_pnl: 1,
+            portfolio_unrealized_pnl: 1,
+            portfolio_pnl: 1,
+            portfolio_total_equity: 1
+        })
         .sort({ session_id: 1, timestamp: 1 })
         .toArray();
 };
 
 const getTradingPnlSummary = async (sessionId, year, month) => {
+    return httpCache.run(`pnl:${sessionId}:${year}:${month}`, 15000, () => getTradingPnlSummaryUncached(sessionId, year, month));
+};
+
+const getTradingPnlSummaryUncached = async (sessionId, year, month) => {
+    
     const logs = await fetchTradingLogs(sessionId);
     return calculateDailyFinalPnl(logs, year, month);
 };
 
 const getUserTradingPnlSummary = async (userId, year, month) => {
+    return httpCache.run(`pnlAgg:${userId}:${year}:${month}`, 15000, () => getUserTradingPnlSummaryUncached(userId, year, month));
+};
+
+const getUserTradingPnlSummaryUncached = async (userId, year, month) => {
+    
     const sessions = await mongoose.model('TradingSession')
         .find({ user_id: userId, python_session_id: { $exists: true, $ne: null } })
         .select('python_session_id')
@@ -659,6 +702,11 @@ const syncStoppedPluginSessionToTradingSession = async (sessionId, pluginSession
  * Fetch session status from the specialized plugin DB
  */
 const fetchSessionStatus = async (sessionId) => {
+    return httpCache.run(`status:${sessionId}`, 5000, () => fetchSessionStatusUncached(sessionId));
+};
+
+const fetchSessionStatusUncached = async (sessionId) => {
+    
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
 
@@ -673,6 +721,7 @@ const fetchSessionStatus = async (sessionId) => {
 };
 
 const resetPluginSessionToAuthenticated = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
     const authenticatedAt = new Date();
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
@@ -700,6 +749,7 @@ const resetPluginSessionToAuthenticated = async (sessionId, metadata = {}) => {
 };
 
 const markPluginSessionAuthenticated = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
     const authenticatedAt = new Date();
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
@@ -733,6 +783,7 @@ const markPluginSessionAuthenticated = async (sessionId, metadata = {}) => {
 };
 
 const markPluginSessionTradingActive = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
     const startedAt = new Date();
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
@@ -758,6 +809,7 @@ const markPluginSessionTradingActive = async (sessionId, metadata = {}) => {
 };
 
 const markPluginSessionStopped = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
     const stoppedAt = metadata.stopped_at ? new Date(metadata.stopped_at) : new Date();
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
@@ -787,6 +839,7 @@ const markPluginSessionStopped = async (sessionId, metadata = {}) => {
  * trading engine. This is intentionally only for manual recovery/testing.
  */
 const debugStopPluginSession = async (sessionId) => {
+    httpCache.invalidateSession(sessionId);
     const stoppedAt = new Date();
     const db = getPluginDb();
     const collection = db.collection("plugin_sessions");
@@ -827,6 +880,11 @@ const debugStopPluginSession = async (sessionId) => {
  * Aggregate dashboard state (Status, Snapshot, Logs)
  */
 const getDashboardState = async (userId, sessionId) => {
+    return httpCache.run(`dash:${userId}:${sessionId}`, 5000, () => getDashboardStateUncached(userId, sessionId));
+};
+
+const getDashboardStateUncached = async (userId, sessionId) => {
+    
     logger.info("Fetching dashboard state", { userId, sessionId });
 
     const ts = await mongoose.model('TradingSession').findOne({ python_session_id: sessionId });
@@ -964,6 +1022,11 @@ const restoreAuthenticatedSessionInPluginDb = async (sessionId, metadata = {}) =
  * Get full session state (status, snapshot, trades)
  */
 const getFullSessionState = async (userId, pythonSessionId) => {
+    return httpCache.run(`full:${userId}:${pythonSessionId}`, 5000, () => getFullSessionStateUncached(userId, pythonSessionId));
+};
+
+const getFullSessionStateUncached = async (userId, pythonSessionId) => {
+    
     logger.info("Fetching full session state", { userId, pythonSessionId });
 
     const ts = await mongoose.model('TradingSession').findOne({ python_session_id: pythonSessionId });
@@ -1000,6 +1063,7 @@ const getFullSessionState = async (userId, pythonSessionId) => {
  * all existing trading_logs docs for that session + symbol.
  */
 const saveFinalPnlSnapshot = async (sessionId) => {
+    httpCache.invalidateSession(sessionId);
     try {
         const ts = await mongoose.model('TradingSession').findOne({ python_session_id: sessionId });
         const targetBaseUrl = resolvePluginTargetUrl(ts);
@@ -1014,14 +1078,33 @@ const saveFinalPnlSnapshot = async (sessionId) => {
             { timeoutMs: 10000, retries: 1, failOnError: false, targetBaseUrl }
         );
 
-        const symbols = result?.data?.data?.symbols ?? result?.data?.symbols;
-
-        if (!symbols || Object.keys(symbols).length === 0) {
-            logger.warn('saveFinalPnlSnapshot: no symbols in live-pnl response', { sessionId });
-            return;
-        }
+        let symbols = result?.data?.data?.symbols ?? result?.data?.symbols;
 
         const collection = getPluginDb().collection('trading_logs');
+
+        // A stopped session often no longer reports symbols from the plugin VM.
+        // Fall back to the last trading-log row per symbol so we still capture
+        // the final realized P&L.
+        if (!symbols || Object.keys(symbols).length === 0) {
+            const lastLogs = await collection
+                .find({ session_id: sessionId })
+                .sort({ _id: 1 })
+                .toArray();
+            symbols = {};
+            for (const log of lastLogs) {
+                const sym = String(log.symbol || '').toUpperCase();
+                if (!sym || sym === '-') continue;
+                symbols[sym] = {
+                    realized_pnl: Number(log.symbol_realized_pnl ?? log.realized_pnl ?? 0) || 0,
+                    live_unrealized_pnl: Number(log.symbol_unrealized_pnl ?? log.unrealized_pnl ?? 0) || 0
+                };
+            }
+        }
+
+        if (!symbols || Object.keys(symbols).length === 0) {
+            logger.warn('saveFinalPnlSnapshot: no symbols to persist', { sessionId });
+            return;
+        }
 
         await Promise.all(
             Object.entries(symbols).map(async ([symbol, info]) => {
@@ -1045,9 +1128,74 @@ const saveFinalPnlSnapshot = async (sessionId) => {
             })
         );
 
+        await saveFinalLivePnlSnapshot(sessionId, userId, ts, symbols);
+
         logger.info('saveFinalPnlSnapshot: stamped final_pnl', { sessionId, symbols: Object.keys(symbols) });
     } catch (err) {
         logger.warn('saveFinalPnlSnapshot failed', { sessionId, error: err.message });
+    }
+};
+
+/**
+ * Persist a final live_pnl_snapshot on session close so the P&L chart / panel
+ * end on the realized values instead of the last pre-close (unrealized)
+ * snapshot — which is what caused the trade-log vs graph disparity.
+ */
+const saveFinalLivePnlSnapshot = async (sessionId, userId, ts, symbols) => {
+    try {
+        const snapCollection = getPluginDb().collection('live_pnl_snapshots');
+        const existing = await snapCollection.findOne(
+            { session_id: sessionId },
+            { sort: { source_time: -1 }, projection: { market_date: 1 } }
+        );
+        const marketDate = existing?.market_date
+            || getDateKeyFromTimestamp(ts?.ended_at || ts?.created_at || new Date());
+        if (!marketDate) return;
+
+        const snapSymbols = {};
+        let total = 0;
+        for (const [sym, info] of Object.entries(symbols)) {
+            const realized = Number(info?.realized_pnl ?? 0) || 0;
+            const unrealized = Number(info?.unrealized_pnl ?? info?.live_unrealized_pnl ?? 0) || 0;
+            const sum = parseFloat((realized + unrealized).toFixed(2));
+            total += sum;
+            snapSymbols[sym] = {
+                realized_pnl: realized,
+                unrealized_pnl: unrealized,
+                total_pnl: sum,
+                qty: info?.qty ?? null,
+                side: info?.side ?? info?.signal ?? null,
+                position_status: 'CLOSED',
+                exit_reason: null
+            };
+        }
+
+        const now = new Date();
+        const doc = {
+            session_id: sessionId,
+            user_id: userId,
+            phase: 'live',
+            market_date: marketDate,
+            source_key: 'final',
+            source_ts: now.getTime() / 1000,
+            source_time: now,
+            sampled_at: now,
+            total_pnl: parseFloat(total.toFixed(2)),
+            realized_pnl: parseFloat(Object.values(snapSymbols).reduce((a, s) => a + s.realized_pnl, 0).toFixed(2)),
+            live_unrealized_pnl: parseFloat(Object.values(snapSymbols).reduce((a, s) => a + s.unrealized_pnl, 0).toFixed(2)),
+            symbols: snapSymbols,
+            updated_at: now
+        };
+
+        await snapCollection.updateOne(
+            { session_id: sessionId, user_id: userId, source_key: 'final' },
+            { $set: doc, $setOnInsert: { created_at: now } },
+            { upsert: true }
+        );
+
+        logger.info('saveFinalLivePnlSnapshot: wrote final snapshot', { sessionId, marketDate, symbols: Object.keys(snapSymbols) });
+    } catch (err) {
+        logger.warn('saveFinalLivePnlSnapshot failed', { sessionId, error: err.message });
     }
 };
 
@@ -1199,8 +1347,16 @@ const resumeLivePnlSnapshotMonitors = async () => {
     return sessions.length;
 };
 
-const getLivePnlHistory = async (userId, sessionId, marketDate) => {
-    logger.info("Fetching saved live PnL history", { userId, sessionId, marketDate });
+const SNAPSHOT_DECIMATE_TARGET = 480;
+
+
+const getLivePnlHistory = async (userId, sessionId, marketDate, stepSeconds) => {
+    return httpCache.run(`hist:${userId}:${sessionId}:${marketDate || ""}:${stepSeconds || ""}`, 15000, () => getLivePnlHistoryUncached(userId, sessionId, marketDate, stepSeconds));
+};
+
+const getLivePnlHistoryUncached = async (userId, sessionId, marketDate, stepSeconds) => {
+    
+    logger.info("Fetching saved live PnL history", { userId, sessionId, marketDate, stepSeconds });
 
     const userIdValue = userId?.toString();
     const collection = await getLivePnlCollection();
@@ -1221,15 +1377,41 @@ const getLivePnlHistory = async (userId, sessionId, marketDate) => {
         };
     }
 
+    const baseFilter = { session_id: sessionId, user_id: userIdValue, market_date: targetMarketDate };
+
+    // Decimate inside Mongo so only the downsampled points cross the wire —
+    // fetching every stored snapshot (6k+/day) is slow over remote connections.
+    let step = Math.floor(Number(stepSeconds) || 0);
+    if (step < 1 || step > 3600) {
+        const [first, last] = await Promise.all([
+            collection.findOne(baseFilter, { sort: { source_time: 1 }, projection: { source_time: 1 } }),
+            collection.findOne(baseFilter, { sort: { source_time: -1 }, projection: { source_time: 1 } })
+        ]);
+        const rangeSeconds = Math.max(
+            Math.floor(((last?.source_time?.getTime?.() ?? 0) - (first?.source_time?.getTime?.() ?? 0)) / 1000),
+            1
+        );
+        step = Math.max(1, Math.ceil(rangeSeconds / SNAPSHOT_DECIMATE_TARGET));
+    }
+
     const snapshots = await collection
-        .find({ session_id: sessionId, user_id: userIdValue, market_date: targetMarketDate })
-        .project({ _id: 0 })
-        .sort({ source_time: -1, sampled_at: -1 })
+        .aggregate([
+            { $match: baseFilter },
+            { $sort: { source_time: 1 } },
+            {
+                $group: {
+                    _id: { $floor: { $divide: [{ $toLong: "$source_time" }, 1000 * step] } },
+                    doc: { $last: "$$ROOT" }
+                }
+            },
+            { $replaceRoot: { newRoot: "$doc" } },
+            { $sort: { source_time: 1 } }
+        ])
         .toArray();
 
     return {
         market_date: targetMarketDate,
-        snapshots: snapshots.reverse().map(normalizeLivePnlSnapshot)
+        snapshots: snapshots.map(normalizeLivePnlSnapshot)
     };
 };
 
@@ -1274,12 +1456,22 @@ const getTradingSnapshot = async (sessionId, userId) => {
 };
 
 const getPyramidPnl = async (sessionId, userId) => {
+    return httpCache.run(`pyramid:${userId}:${sessionId}`, 15000, () => getPyramidPnlUncached(sessionId, userId));
+};
+
+const getPyramidPnlUncached = async (sessionId, userId) => {
+    
     logger.info("Fetching Bear Street pyramid PnL snapshot", { sessionId, userId });
     const pluginRes = await proxyGet(`/api/trading/pyramid-pnl/${sessionId}`, { sessionId, userId });
     return pluginRes?.data;
 };
 
 const getExitedSymbols = async (userId, sessionId) => {
+    return httpCache.run(`exited:${userId}:${sessionId}`, 15000, () => getExitedSymbolsUncached(userId, sessionId));
+};
+
+const getExitedSymbolsUncached = async (userId, sessionId) => {
+    
     logger.info("Fetching Bear Street exited symbols", { userId, sessionId });
     const pluginRes = await proxyGet(`/api/trading/exited-symbols/${sessionId}`, { sessionId, userId });
     return pluginRes?.data;
