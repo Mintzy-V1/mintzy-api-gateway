@@ -3,6 +3,8 @@ import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
 import TradingSession from "../../../models/tradingSession.js";
 import SavedTradingConfiguration from "../../../models/savedTradingConfiguration.js";
+import * as performanceService from "../../../services/performance.service.js";
+import * as scheduledStartService from "../../../services/scheduledStart.service.js";
 
 // Services
 import * as proxyService from "../services/plugin.proxy.service.js";
@@ -261,11 +263,27 @@ const submitTotp = catchAsync(async (req, res) => {
 
 /**
  * @desc Start morning simulation (Angel One hybrid flow)
+ * Held until 10:30 AM IST: before that the start is persisted and fired by a
+ * background poller so it happens even when the desktop app is closed.
  */
 const startSimulation = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    const scheduled = await scheduledStartService.maybeScheduleStart(userId, req.body);
+    if (scheduled) {
+        return res.status(200).json({ success: true, ...scheduled });
+    }
     const result = await simulationService.startSimulation(userId, req.body);
     res.status(200).json({ success: true, ...result });
+});
+
+/**
+ * @desc Cached performance metrics (dashboard + month-over-month) computed
+ * from trading logs and refreshed daily at 4:30 PM IST.
+ */
+const getPerformanceStats = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const stats = await performanceService.getPerformanceStats(userId);
+    res.status(200).json({ success: true, stats });
 });
 
 /**
@@ -364,6 +382,7 @@ const abandonSession = catchAsync(async (req, res) => {
     ts.ended_at = new Date();
     await ts.save();
     dataService.stopLivePnlSnapshotMonitor(sessionId, ts.user_id);
+    scheduledStartService.clearScheduledStart(sessionId);
 
     res.status(200).json({ success: true, message: "Session abandoned" });
 });
@@ -794,6 +813,7 @@ export {
     stopSimulation,
     getSimulationStatus,
     getPyramidPnl,
+    getPerformanceStats,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -842,6 +862,7 @@ export default {
     stopSimulation,
     getSimulationStatus,
     getPyramidPnl,
+    getPerformanceStats,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,

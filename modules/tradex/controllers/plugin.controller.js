@@ -3,6 +3,7 @@ import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
 import TradingSession from "../../../models/tradingSession.js";
 import SavedTradingConfiguration from "../../../models/savedTradingConfiguration.js";
+import * as performanceService from "../../../services/performance.service.js";
 
 // Services
 import * as proxyService from "../services/plugin.proxy.service.js";
@@ -460,6 +461,16 @@ const getUserPnlSummary = catchAsync(async (req, res) => {
 });
 
 /**
+ * @desc Cached performance metrics (dashboard + month-over-month) computed
+ * from trading logs and refreshed daily at 4:30 PM IST.
+ */
+const getPerformanceStats = catchAsync(async (req, res) => {
+    const userId = getRequestUserId(req);
+    const stats = await performanceService.getPerformanceStats(userId);
+    res.status(200).json({ success: true, stats });
+});
+
+/**
  * @desc Get session state or restore via token
  */
 const getSessionState = catchAsync(async (req, res) => {
@@ -804,6 +815,7 @@ export {
     stopSimulation,
     getSimulationStatus,
     getPyramidPnl,
+    getPerformanceStats,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,
@@ -853,6 +865,7 @@ export default {
     stopSimulation,
     getSimulationStatus,
     getPyramidPnl,
+    getPerformanceStats,
     startTrading,
     stopTradingBySessionId,
     stopTradingByBodyId,

@@ -256,6 +256,11 @@ router.get('/dashboard/pnl/aggregate',
   pluginController.getUserPnlSummary
 );
 
+router.get('/dashboard/performance-stats',
+  authMiddleware,
+  pluginController.getPerformanceStats
+);
+
 router.get('/trading/sessions',
   authMiddleware,
   pluginController.getUserTradingSessions
