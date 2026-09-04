@@ -1,10 +1,11 @@
-
 import cors from "cors"
 
 const corsMiddleware = cors({
 
-    origin:"*",
-    credentials:true,
+    // Echo the request origin instead of "*" — wildcard + credentials is
+    // rejected by browsers, which broke desktop-app requests (file:// origin).
+    origin: (origin, callback) => callback(null, origin || "*"),
+    credentials: true,
     methods:[
         "GET",
         "POST",
