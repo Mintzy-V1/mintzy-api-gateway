@@ -25,7 +25,16 @@ const tradingSessionSchema = new mongoose.Schema({
   simulation_live_switch_triggered: { type: Boolean, default: false },
   simulation_live_started_at: { type: Date },
   simulation_trade_date: { type: String },
-  simulation_output: { type: mongoose.Schema.Types.Mixed }
+  simulation_output: { type: mongoose.Schema.Types.Mixed },
+  scheduled_start: {
+    payload: { type: mongoose.Schema.Types.Mixed },
+    start_at: { type: Date },
+    status: { type: String, enum: ['pending', 'firing', 'fired', 'failed', 'cancelled'] },
+    attempts: { type: Number, default: 0 },
+    error: { type: String },
+    created_at: { type: Date },
+    fired_at: { type: Date }
+  }
 });
 
 export default mongoose.models.TradingSession || mongoose.model("TradingSession", tradingSessionSchema);
