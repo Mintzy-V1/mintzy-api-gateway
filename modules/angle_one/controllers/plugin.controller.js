@@ -11,6 +11,7 @@ import * as proxyService from "../services/plugin.proxy.service.js";
 import * as tradingService from "../services/plugin.trading.service.js";
 import * as adminService from "../services/plugin.admin.service.js";
 import * as dataService from "../services/plugin.data.service.js";
+import * as httpCache from "../../../utils/httpCache.js";
 import * as simulationService from "../services/plugin.simulation.service.js";
 
 const MAX_SAVED_TRADING_CONFIGURATIONS = 5;
@@ -30,7 +31,9 @@ const getRequestUserId = (req) => {
  */
 const getUserTradingSessions = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
-    const sessions = await TradingSession.find({ user_id: userId }).sort({ created_at: -1 }).lean();
+    const sessions = await httpCache.run(`sessions:${userId}`, 10000, () =>
+        TradingSession.find({ user_id: userId }).sort({ created_at: -1 }).lean()
+    );
     res.status(200).json({ success: true, sessions });
 });
 
@@ -268,6 +271,7 @@ const submitTotp = catchAsync(async (req, res) => {
  */
 const startSimulation = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
     const scheduled = await scheduledStartService.maybeScheduleStart(userId, req.body);
     if (scheduled) {
         return res.status(200).json({ success: true, ...scheduled });
@@ -317,6 +321,7 @@ const getPyramidPnl = catchAsync(async (req, res) => {
  */
 const startTrading = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
     const result = await tradingService.startTrading(userId, req.body);
     res.status(200).json({ success: true, ...result });
 });
@@ -326,6 +331,7 @@ const startTrading = catchAsync(async (req, res) => {
  */
 const stopTradingBySessionId = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
     const { sessionId } = req.params;
     const result = await tradingService.stopTrading(userId, sessionId);
     dataService.saveFinalPnlSnapshot(sessionId).catch(err =>
@@ -339,6 +345,7 @@ const stopTradingBySessionId = catchAsync(async (req, res) => {
  */
 const stopTradingByBodyId = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
     const { session_id } = req.body;
     const result = await tradingService.stopTrading(userId, session_id);
     dataService.saveFinalPnlSnapshot(session_id).catch(err =>
@@ -352,6 +359,7 @@ const stopTradingByBodyId = catchAsync(async (req, res) => {
  */
 const stopSession = catchAsync(async (req, res) => {
     const { sessionId } = req.params;
+    httpCache.invalidateSession(sessionId);
     const session = await TradingSession.findOneAndUpdate(
         { python_session_id: sessionId, status: { $ne: "stopped" } },
         { $set: { status: "stopped", ended_at: new Date() } },
@@ -372,6 +380,8 @@ const stopSession = catchAsync(async (req, res) => {
  */
 const abandonSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
+    httpCache.invalidateSession(sessionId);
     const { sessionId } = req.params; // python_session_id
 
     const ts = await TradingSession.findOne({ python_session_id: sessionId, user_id: userId });
@@ -573,6 +583,8 @@ const downloadFinalTradebook = catchAsync(async (req, res) => {
  */
 const adminStopSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
+    httpCache.invalidateSession(sessionId);
     const { sessionId } = req.params;
     const result = await adminService.adminStopSession(userId, sessionId);
 
@@ -635,6 +647,7 @@ const deleteTradingSession = catchAsync(async (req, res) => {
  */
 const deleteTradingSessionByIdParam = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
+    httpCache.invalidateUser(userId);
     const { id } = req.params;
     const session = await adminService.deleteTradingSessionByIdParam(userId, id);
     if (!session) throw new AppError("Session not found", 404);
@@ -738,9 +751,9 @@ const getLivePnl = catchAsync(async (req, res) => {
 const getLivePnlHistory = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     const { session_id } = req.params;
-    const { date } = req.query;
+    const { date, step } = req.query;
 
-    const history = await dataService.getLivePnlHistory(userId, session_id, date);
+    const history = await dataService.getLivePnlHistory(userId, session_id, date, step);
 
     res.status(200).json({
         success: true,
