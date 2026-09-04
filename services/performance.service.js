@@ -256,6 +256,7 @@ const computePerformanceStats = (logs) => {
 };
 
 const fetchLogsForSessions = async (sessionIds) => {
+  if (!Array.isArray(sessionIds) || sessionIds.length === 0) return [];
   const collection = getPluginDb().collection("trading_logs");
   return collection
     .find({ session_id: { $in: sessionIds } })
