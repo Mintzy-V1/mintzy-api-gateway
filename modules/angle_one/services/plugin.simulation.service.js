@@ -26,8 +26,8 @@ const logSimGwTiming = (event, fields = {}) => {
 const SIMULATION_POLL_INTERVAL_MS = parseInt(process.env.SIMULATION_POLL_INTERVAL_MS || "60000", 10);
 const SIMULATION_POLL_START_HOUR_IST = parseInt(process.env.SIMULATION_POLL_START_HOUR_IST || "12", 10);
 const SIMULATION_POLL_START_MINUTE_IST = parseInt(process.env.SIMULATION_POLL_START_MINUTE_IST || "45", 10);
-const SIMULATION_AUTO_STOP_HOUR_IST = parseInt(process.env.SIMULATION_AUTO_STOP_HOUR_IST || "13", 10);
-const SIMULATION_AUTO_STOP_MINUTE_IST = parseInt(process.env.SIMULATION_AUTO_STOP_MINUTE_IST || "0", 10);
+const SIMULATION_AUTO_STOP_HOUR_IST = parseInt(process.env.SIMULATION_AUTO_STOP_HOUR_IST || "12", 10);
+const SIMULATION_AUTO_STOP_MINUTE_IST = parseInt(process.env.SIMULATION_AUTO_STOP_MINUTE_IST || "58", 10);
 const SIMULATION_REQUEST_TIMEOUT = parseInt(process.env.SIMULATION_REQUEST_TIMEOUT || "60000", 10);
 
 const ACTIVE_SIMULATION_STATUSES = ["pending", "running", "started"];
