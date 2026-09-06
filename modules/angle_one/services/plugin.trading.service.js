@@ -140,6 +140,14 @@ const pollStopSimulationUntilReady = async (userId, sessionId, targetBaseUrl) =>
         }
 
         if (isStopSimulationJobReady(statusData)) {
+            console.log("[SIM-GW-TIMING] stopSimulationTrading poll completed", {
+                sessionId,
+                pollCount,
+                status: statusData?.status,
+                ready: statusData?.ready,
+                live_allowed: statusData?.live_allowed,
+                elapsedMs: Date.now() - pollStartedMs
+            });
             return statusData;
         }
 
@@ -539,7 +547,8 @@ const startTrading = async (userId, payload = {}) => {
     return pluginRes ? pluginRes.data : null;
 };
 
-const stopSimulationTrading = async (userId, sessionId) => {
+const stopSimulationTrading = async (userId, sessionId, options = {}) => {
+    const { onStopPollComplete } = options;
     const endpointStartedMs = Date.now();
     console.log("\n[SIM-HANDOFF-DEBUG] stopSimulationTrading START", {
         userId: userId?.toString(),
@@ -653,6 +662,10 @@ const stopSimulationTrading = async (userId, sessionId) => {
         pyramid_reason: stopResponse?.pyramid?.reason ?? null,
         totalElapsedMs: Date.now() - endpointStartedMs
     });
+
+    if (typeof onStopPollComplete === "function") {
+        await onStopPollComplete(stopResponse);
+    }
 
     return stopResponse;
 };
