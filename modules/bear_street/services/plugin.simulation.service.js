@@ -27,15 +27,23 @@ const logSimGwTiming = (event, fields = {}) => {
 const SIMULATION_POLL_INTERVAL_MS = parseInt(process.env.SIMULATION_POLL_INTERVAL_MS || "60000", 10);
 const SIMULATION_POLL_START_HOUR_IST = parseInt(process.env.SIMULATION_POLL_START_HOUR_IST || "12", 10);
 const SIMULATION_POLL_START_MINUTE_IST = parseInt(process.env.SIMULATION_POLL_START_MINUTE_IST || "45", 10);
-const SIMULATION_AUTO_STOP_HOUR_IST = parseInt(process.env.SIMULATION_AUTO_STOP_HOUR_IST || "13", 10);
-const SIMULATION_AUTO_STOP_MINUTE_IST = parseInt(process.env.SIMULATION_AUTO_STOP_MINUTE_IST || "0", 10);
+const SIMULATION_AUTO_STOP_HOUR_IST = parseInt(process.env.SIMULATION_AUTO_STOP_HOUR_IST || "12", 10);
+const SIMULATION_AUTO_STOP_MINUTE_IST = parseInt(process.env.SIMULATION_AUTO_STOP_MINUTE_IST || "59", 10);
+const SIMULATION_LIVE_START_HOUR_IST = parseInt(process.env.SIMULATION_LIVE_START_HOUR_IST || "13", 10);
+const SIMULATION_LIVE_START_MINUTE_IST = parseInt(process.env.SIMULATION_LIVE_START_MINUTE_IST || "0", 10);
+const SIMULATION_LIVE_START_SECOND_IST = parseInt(process.env.SIMULATION_LIVE_START_SECOND_IST || "5", 10);
+const SIMULATION_LIVE_START_POLL_MS = parseInt(process.env.SIMULATION_LIVE_START_POLL_MS || "5000", 10);
 const SIMULATION_REQUEST_TIMEOUT = parseInt(process.env.SIMULATION_REQUEST_TIMEOUT || "60000", 10);
 
 const ACTIVE_SIMULATION_STATUSES = ["pending", "running", "started"];
 const CANCELLED_SIMULATION_STATUSES = ["cancelling", "cancelled"];
+const LIVE_START_PENDING_STATUSES = ["live_start_pending", "live_start_in_progress"];
+const HANDOFF_BUSY_STATUSES = ["handoff_in_progress", ...LIVE_START_PENDING_STATUSES];
 let pollerStarted = false;
 let pollInProgress = false;
 let lastAutoStopDateKey = null;
+/** @type {Map<string, NodeJS.Timeout>} session_id -> per-session live-start timer */
+const scheduledLiveStartTimers = new Map();
 
 const isSimulationCancellationRequested = (session) =>
     Boolean(
@@ -143,6 +151,15 @@ const failClosedStopSimulation = async (session, err) => {
 };
 
 const getIstDateParts = (date = new Date()) => {
+    const clock = getIstClockParts(date);
+    return {
+        dateKey: clock.dateKey,
+        hour: clock.hour,
+        minute: clock.minute
+    };
+};
+
+const getIstClockParts = (date = new Date()) => {
     const formatter = new Intl.DateTimeFormat("en-CA", {
         timeZone: DATE_TIMEZONE,
         year: "numeric",
@@ -150,6 +167,7 @@ const getIstDateParts = (date = new Date()) => {
         day: "2-digit",
         hour: "2-digit",
         minute: "2-digit",
+        second: "2-digit",
         hour12: false
     });
     const parts = formatter.formatToParts(date);
@@ -158,11 +176,43 @@ const getIstDateParts = (date = new Date()) => {
     return {
         dateKey: `${lookup.year}-${lookup.month}-${lookup.day}`,
         hour: Number(lookup.hour),
-        minute: Number(lookup.minute)
+        minute: Number(lookup.minute),
+        second: Number(lookup.second)
     };
 };
 
 const getTodayTradeDateIst = () => getIstDateParts().dateKey;
+
+const getLiveStartWindowIstLabel = () =>
+    `${String(SIMULATION_LIVE_START_HOUR_IST).padStart(2, "0")}:`
+    + `${String(SIMULATION_LIVE_START_MINUTE_IST).padStart(2, "0")}:`
+    + `${String(SIMULATION_LIVE_START_SECOND_IST).padStart(2, "0")}`;
+
+const getIstSecondsSinceMidnight = (date = new Date()) => {
+    const { hour, minute, second } = getIstClockParts(date);
+    return (hour * 3600) + (minute * 60) + second;
+};
+
+const getLiveStartSecondsSinceMidnight = () =>
+    (SIMULATION_LIVE_START_HOUR_IST * 3600)
+    + (SIMULATION_LIVE_START_MINUTE_IST * 60)
+    + SIMULATION_LIVE_START_SECOND_IST;
+
+const isLiveStartWindowOpen = (date = new Date()) =>
+    getIstSecondsSinceMidnight(date) >= getLiveStartSecondsSinceMidnight();
+
+const getMsUntilLiveStartWindow = (date = new Date()) => {
+    const delaySec = getLiveStartSecondsSinceMidnight() - getIstSecondsSinceMidnight(date);
+    return delaySec <= 0 ? 0 : delaySec * 1000;
+};
+
+const clearScheduledLiveStart = (sessionId) => {
+    const existing = scheduledLiveStartTimers.get(sessionId);
+    if (existing) {
+        clearTimeout(existing);
+        scheduledLiveStartTimers.delete(sessionId);
+    }
+};
 
 const isSimulationPollWindowOpen = (date = new Date()) => {
     const { hour, minute } = getIstDateParts(date);
@@ -848,108 +898,128 @@ const isLiveTradingConfirmed = async (userId, session) => {
     return gatewayLive && pluginLive;
 };
 
-const executeSimulationToLiveHandoff = async (userId, session) => {
-    const session_id = session.python_session_id;
-    const handoffStartedMs = Date.now();
+const buildDeferredLiveStartResponse = (session, stopResponse, sessionDoc = null) => {
+    const session_id = session.python_session_id || sessionDoc?.python_session_id;
+    const savedConfigurationId = session.saved_configuration_id?.toString?.()
+        || sessionDoc?.saved_configuration_id?.toString?.()
+        || null;
 
-    console.log("[SIM-HANDOFF-DEBUG] executeSimulationToLiveHandoff START", { session_id });
-    logSimGwTiming("executeSimulationToLiveHandoff ENTER", {
+    return {
         session_id,
-        saved_configuration_id: session.saved_configuration_id?.toString()
-    });
+        configuration_id: savedConfigurationId,
+        saved_configuration_id: savedConfigurationId,
+        stop: stopResponse,
+        live_trading: null,
+        status: sessionDoc?.status || session.status || "simulation_active",
+        simulation_status: sessionDoc?.simulation_status || "live_start_pending",
+        live_allowed: true,
+        live_start_deferred: true,
+        live_start_scheduled_after_ist: getLiveStartWindowIstLabel(),
+        message: `Simulation stopped. Live trading scheduled at ${getLiveStartWindowIstLabel()} IST.`
+    };
+};
 
-    const stopStartedMs = Date.now();
-    const stopResponse = await stopSimulationTrading(userId, session_id);
-    logSimGwTiming("executeSimulationToLiveHandoff stop-simulation phase", {
-        session_id,
-        stopPhaseMs: simGwElapsedMs(stopStartedMs),
-        stopPluginTimingMs: stopResponse?.timing_ms ?? null,
-        configuration_id: stopResponse?.configuration_id ?? session.saved_configuration_id?.toString()
-    });
+const buildLiveStartInProgressResponse = (sessionId, sessionDoc, stopResponse = null) => ({
+    session_id: sessionId,
+    configuration_id: sessionDoc?.saved_configuration_id?.toString?.() || null,
+    saved_configuration_id: sessionDoc?.saved_configuration_id?.toString?.() || null,
+    stop: stopResponse || sessionDoc?.simulation_output?.stop || null,
+    live_trading: null,
+    status: sessionDoc?.status || "simulation_active",
+    simulation_status: sessionDoc?.simulation_status || "live_start_in_progress",
+    live_allowed: true,
+    live_start_deferred: true,
+    live_start_in_progress: true,
+    message: "Simulation stop complete. Live trading start is already in progress."
+});
 
-    if (stopResponse?.success === false) {
-        throw new AppError(stopResponse?.message || "Failed to stop simulation session", 502);
+const persistLiveStartPending = async (session, stopResponse) => {
+    const scheduledAfter = getLiveStartWindowIstLabel();
+    const deferredAt = new Date();
+
+    const updated = await TradingSession.findOneAndUpdate(
+        {
+            _id: session._id,
+            simulation_cancel_requested: { $ne: true },
+            simulation_status: { $in: ["handoff_in_progress", "live_start_pending"] }
+        },
+        {
+            $set: {
+                simulation_status: "live_start_pending",
+                simulation_live_switch_triggered: true,
+                simulation_output: {
+                    stop: stopResponse,
+                    live_start_deferred_at: deferredAt,
+                    live_start_scheduled_after_ist: scheduledAfter
+                }
+            }
+        },
+        { returnDocument: "after" }
+    ).lean();
+
+    if (updated) {
+        logSimGwTiming("live start deferred (non-blocking)", {
+            session_id: session.python_session_id,
+            scheduled_after_ist: scheduledAfter
+        });
+        return updated;
     }
+
+    return TradingSession.findById(session._id).lean();
+};
+
+const claimLiveStartLock = async (session, userId) => {
+    if (!isLiveStartWindowOpen()) {
+        return null;
+    }
+
+    return TradingSession.findOneAndUpdate(
+        {
+            _id: session._id,
+            user_id: userId,
+            simulation_cancel_requested: { $ne: true },
+            simulation_status: { $in: ["handoff_in_progress", "live_start_pending"] }
+        },
+        {
+            $set: {
+                simulation_status: "live_start_in_progress"
+            }
+        },
+        { returnDocument: "after" }
+    );
+};
+
+const releaseLiveStartLockToPending = async (sessionId, errorMessage = null) => {
+    const update = {
+        simulation_status: "live_start_pending"
+    };
+
+    if (errorMessage) {
+        update["simulation_output.live_start_last_error"] = String(errorMessage).slice(0, 500);
+    }
+
+    await TradingSession.findOneAndUpdate(
+        {
+            _id: sessionId,
+            simulation_status: "live_start_in_progress"
+        },
+        { $set: update }
+    );
+};
+
+const executeLiveStartPhase = async (userId, session, stopResponse) => {
+    const session_id = session.python_session_id;
+
+    const latestSessionBeforeLive = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSessionBeforeLive)) {
+        throw new AppError("Simulation was cancelled by user. Live trading will not start for this session.", 409);
+    }
+
+    await prepareSessionForLiveTrading(userId, session);
 
     const symbolsForLive = Array.isArray(stopResponse?.pyramid?.symbols_for_live)
         ? stopResponse.pyramid.symbols_for_live.filter((entry) => entry?.symbol && Number(entry?.capital) > 0)
         : [];
-
-    if (stopResponse?.live_allowed === false) {
-        logSimGwTiming("executeSimulationToLiveHandoff blocked — no profitable symbols", {
-            session_id,
-            pyramid_reason: stopResponse?.pyramid?.reason || stopResponse?.stopped_reason || null,
-            plugin_status: stopResponse?.status || null
-        });
-        const noLiveResult = await finalizeNoProfitableSymbolsSession(session, stopResponse);
-        return {
-            stopResponse,
-            liveStartResult: null,
-            noLiveResult
-        };
-    }
-
-    if (stopResponse?.live_allowed !== true || symbolsForLive.length === 0) {
-        const blockedReason = stopResponse?.live_allowed !== true
-            ? "live_not_explicitly_allowed"
-            : "missing_symbols_for_live";
-        const pyramidReason = stopResponse?.pyramid?.reason || stopResponse?.stopped_reason || blockedReason;
-        const guardedStopResponse = {
-            ...(stopResponse || {}),
-            live_allowed: false,
-            stopped_reason: pyramidReason,
-            message: "Simulation stopped. Live trading blocked because stop-simulation did not return valid live symbols.",
-            pyramid: {
-                ...(stopResponse?.pyramid || {}),
-                live_allowed: false,
-                reason: pyramidReason,
-                symbols_for_live: symbolsForLive
-            }
-        };
-
-        logSimGwTiming("executeSimulationToLiveHandoff blocked - invalid live handoff payload", {
-            session_id,
-            plugin_live_allowed: stopResponse?.live_allowed ?? null,
-            pyramid_reason: pyramidReason,
-            symbols_for_live_count: symbolsForLive.length
-        });
-
-        await dataService.markPluginSessionStopped(session_id, {
-            trading_status: "stopped"
-        }).catch((err) => {
-            logger.warn("Failed to mark plugin session stopped after invalid live handoff payload", {
-                sessionId: session_id,
-                error: err.message
-            });
-        });
-
-        const noLiveResult = await finalizeNoProfitableSymbolsSession(session, guardedStopResponse);
-        return {
-            stopResponse: guardedStopResponse,
-            liveStartResult: null,
-            noLiveResult
-        };
-    }
-
-    logSimGwTiming("executeSimulationToLiveHandoff validated stop-simulation response", {
-        session_id,
-        trading_status: stopResponse?.trading_status ?? null,
-        configuration_id: stopResponse?.configuration_id ?? session.saved_configuration_id?.toString(),
-        pluginTimingMs: stopResponse?.timing_ms ?? null,
-        symbols_for_live_count: symbolsForLive.length,
-        note: "live start requires explicit live_allowed true and at least one valid pyramid symbol"
-    });
-
-    const latestSessionBeforeLive = await TradingSession.findById(session._id).lean();
-    if (isSimulationCancellationRequested(latestSessionBeforeLive)) {
-        return {
-            stopResponse,
-            liveStartResult: null,
-            noLiveResult: buildSimulationCancelledResponse(session_id, latestSessionBeforeLive)
-        };
-    }
-
-    await prepareSessionForLiveTrading(userId, session);
 
     const liveStartPayload = {
         session_id,
@@ -974,14 +1044,334 @@ const executeSimulationToLiveHandoff = async (userId, session) => {
         );
     }
 
+    return liveStartResult;
+};
+
+const runScheduledLiveStart = async (userId, sessionId) => {
+    clearScheduledLiveStart(sessionId);
+
+    const session = await TradingSession.findOne({ python_session_id: sessionId }).lean();
+    if (!session) {
+        return;
+    }
+
+    if (isSimulationCancellationRequested(session)) {
+        await TradingSession.findByIdAndUpdate(session._id, {
+            $set: {
+                simulation_status: "cancelled",
+                simulation_live_switch_triggered: false
+            }
+        });
+        return;
+    }
+
+    if (!["handoff_in_progress", "live_start_pending", "live_start_in_progress"].includes(session.simulation_status)) {
+        if (await isLiveTradingConfirmed(userId, session)) {
+            return;
+        }
+        logger.warn("runScheduledLiveStart skipped — unexpected simulation_status", {
+            sessionId,
+            simulation_status: session.simulation_status
+        });
+        return;
+    }
+
+    const stopResponse = session.simulation_output?.stop;
+    if (!stopResponse) {
+        await TradingSession.findByIdAndUpdate(session._id, {
+            $set: {
+                simulation_status: "handoff_failed",
+                simulation_live_switch_triggered: false,
+                "simulation_output.live_start_error": "Missing stop response for scheduled live start"
+            }
+        });
+        return;
+    }
+
+    if (stopResponse?.success === false) {
+        return;
+    }
+
+    if (stopResponse?.live_allowed === false) {
+        await finalizeNoProfitableSymbolsSession(session, stopResponse);
+        return;
+    }
+
+    if (!isLiveStartWindowOpen()) {
+        scheduleLiveStartTimer(userId, session, stopResponse);
+        return;
+    }
+
+    const lockedSession = await claimLiveStartLock(session, userId);
+    if (!lockedSession) {
+        return;
+    }
+
+    try {
+        const liveStartResult = await executeLiveStartPhase(userId, lockedSession, stopResponse);
+        await finalizeSimulationHandoff(lockedSession, { stopResponse, liveStartResult });
+        logSimGwTiming("scheduled live start completed", {
+            session_id: sessionId,
+            scheduled_after_ist: getLiveStartWindowIstLabel()
+        });
+        logger.info("Scheduled live trading started", { sessionId, userId });
+    } catch (err) {
+        if (isSimulationCancellationRequested(await TradingSession.findById(session._id).lean())) {
+            return;
+        }
+
+        await releaseLiveStartLockToPending(session._id, err.message);
+        logger.warn("Scheduled live trading start failed; timer backup will retry", {
+            sessionId,
+            error: err.message
+        });
+    }
+};
+
+const scheduleLiveStartTimer = (userId, session, stopResponse) => {
+    const session_id = session.python_session_id;
+    if (scheduledLiveStartTimers.has(session_id)) {
+        return;
+    }
+
+    const delayMs = getMsUntilLiveStartWindow();
+    if (delayMs <= 0) {
+        runScheduledLiveStart(userId, session_id).catch((err) => {
+            logger.warn("Immediate scheduled live start failed", {
+                sessionId: session_id,
+                error: err.message
+            });
+        });
+        return;
+    }
+
+    logSimGwTiming("live start scheduled via setTimeout (per session)", {
+        session_id,
+        delayMs,
+        fire_at_ist: getLiveStartWindowIstLabel()
+    });
+
+    const timer = setTimeout(() => {
+        runScheduledLiveStart(userId, session_id).catch((err) => {
+            logger.warn("setTimeout live start failed", {
+                sessionId: session_id,
+                error: err.message
+            });
+        });
+    }, delayMs);
+
+    scheduledLiveStartTimers.set(session_id, timer);
+};
+
+const recoverPendingLiveStartTimers = async () => {
+    const today = getTodayTradeDateIst();
+    const sessions = await TradingSession.find({
+        broker: BROKER_KEY,
+        simulation_status: "live_start_pending",
+        simulation_cancel_requested: { $ne: true },
+        simulation_trade_date: today
+    }).sort({ simulation_started_at: 1 });
+
+    if (sessions.length === 0) {
+        return;
+    }
+
+    logSimGwTiming("recoverPendingLiveStartTimers", {
+        count: sessions.length,
+        sessionIds: sessions.map((s) => s.python_session_id)
+    });
+
+    for (const session of sessions) {
+        const session_id = session.python_session_id;
+        if (scheduledLiveStartTimers.has(session_id)) {
+            continue;
+        }
+
+        const userId = session.user_id?.toString();
+        const stopResponse = session.simulation_output?.stop;
+        if (!userId || !stopResponse) {
+            continue;
+        }
+
+        if (isLiveStartWindowOpen()) {
+            runScheduledLiveStart(userId, session_id).catch((err) => {
+                logger.warn("recoverPendingLiveStartTimers immediate start failed", {
+                    sessionId: session_id,
+                    error: err.message
+                });
+            });
+        } else {
+            scheduleLiveStartTimer(userId, session, stopResponse);
+        }
+    }
+};
+
+const scheduleLiveStartAfterStop = async (userId, session, stopResponse) => {
+    const session_id = session.python_session_id;
+
+    if (!isLiveStartWindowOpen()) {
+        const pendingSession = await persistLiveStartPending(session, stopResponse);
+        scheduleLiveStartTimer(userId, pendingSession || session, stopResponse);
+        return {
+            liveStartDeferred: true,
+            deferredResponse: buildDeferredLiveStartResponse(session, stopResponse, pendingSession)
+        };
+    }
+
+    clearScheduledLiveStart(session_id);
+
+    const lockedSession = await claimLiveStartLock(session, userId);
+    if (!lockedSession) {
+        const latestSession = await TradingSession.findById(session._id).lean();
+
+        if (latestSession?.simulation_status === "live_start_pending") {
+            if (!scheduledLiveStartTimers.has(session_id)) {
+                scheduleLiveStartTimer(userId, latestSession, stopResponse);
+            }
+            return {
+                liveStartDeferred: true,
+                deferredResponse: buildDeferredLiveStartResponse(session, stopResponse, latestSession)
+            };
+        }
+
+        if (latestSession?.simulation_status === "live_start_in_progress") {
+            return {
+                liveStartDeferred: true,
+                deferredResponse: buildLiveStartInProgressResponse(session_id, latestSession, stopResponse)
+            };
+        }
+
+        if (await isLiveTradingConfirmed(userId, latestSession || session)) {
+            return {
+                liveStartResult: latestSession?.simulation_output?.live_start || null,
+                alreadyLive: true
+            };
+        }
+
+        throw new AppError("Could not acquire live start lock for this session", 409);
+    }
+
+    try {
+        const liveStartResult = await executeLiveStartPhase(userId, lockedSession, stopResponse);
+        return { liveStartResult };
+    } catch (err) {
+        await releaseLiveStartLockToPending(lockedSession._id, err.message);
+        throw err;
+    }
+};
+
+const resolveLiveHandoffAfterStopComplete = async (userId, session, stopResponse) => {
+    const session_id = session.python_session_id;
+
+    if (stopResponse?.success === false) {
+        throw new AppError(stopResponse?.message || "Failed to stop simulation session", 502);
+    }
+
+    if (stopResponse?.live_allowed === false) {
+        logSimGwTiming("stop poll complete — no live (live_allowed=false)", {
+            session_id,
+            pyramid_reason: stopResponse?.pyramid?.reason || stopResponse?.stopped_reason || null,
+            plugin_status: stopResponse?.status || null
+        });
+        const noLiveResult = await finalizeNoProfitableSymbolsSession(session, stopResponse);
+        return {
+            stopResponse,
+            liveStartResult: null,
+            noLiveResult
+        };
+    }
+
+    logSimGwTiming("stop poll complete — evaluating live start", {
+        session_id,
+        trading_status: stopResponse?.trading_status ?? null,
+        configuration_id: stopResponse?.configuration_id ?? session.saved_configuration_id?.toString(),
+        pluginTimingMs: stopResponse?.timing_ms ?? null,
+        live_start_window_open: isLiveStartWindowOpen(),
+        ms_until_live_start: getMsUntilLiveStartWindow()
+    });
+
+    const latestSessionBeforeLive = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSessionBeforeLive)) {
+        return {
+            stopResponse,
+            liveStartResult: null,
+            noLiveResult: buildSimulationCancelledResponse(session_id, latestSessionBeforeLive)
+        };
+    }
+
+    const liveStartOutcome = await scheduleLiveStartAfterStop(userId, session, stopResponse);
+
+    if (liveStartOutcome.liveStartDeferred) {
+        logSimGwTiming("live start deferred via per-session setTimeout", {
+            session_id,
+            scheduled_after_ist: getLiveStartWindowIstLabel()
+        });
+        return {
+            stopResponse,
+            liveStartResult: null,
+            liveStartDeferred: true,
+            deferredResponse: liveStartOutcome.deferredResponse
+        };
+    }
+
+    if (liveStartOutcome.alreadyLive) {
+        return {
+            stopResponse,
+            liveStartResult: liveStartOutcome.liveStartResult || null,
+            alreadyLive: true
+        };
+    }
+
+    return {
+        stopResponse,
+        liveStartResult: liveStartOutcome.liveStartResult
+    };
+};
+
+const executeSimulationToLiveHandoff = async (userId, session) => {
+    const session_id = session.python_session_id;
+    const handoffStartedMs = Date.now();
+    let handoffResult = null;
+
+    console.log("[SIM-HANDOFF-DEBUG] executeSimulationToLiveHandoff START", { session_id });
+    logSimGwTiming("executeSimulationToLiveHandoff ENTER", {
+        session_id,
+        saved_configuration_id: session.saved_configuration_id?.toString()
+    });
+
+    const stopStartedMs = Date.now();
+    await stopSimulationTrading(userId, session_id, {
+        onStopPollComplete: async (stopResponse) => {
+            logSimGwTiming("executeSimulationToLiveHandoff stop-simulation poll complete", {
+                session_id,
+                stopPhaseMs: simGwElapsedMs(stopStartedMs),
+                stopPluginTimingMs: stopResponse?.timing_ms ?? null,
+                configuration_id: stopResponse?.configuration_id ?? session.saved_configuration_id?.toString()
+            });
+            handoffResult = await resolveLiveHandoffAfterStopComplete(userId, session, stopResponse);
+        }
+    });
+
+    if (!handoffResult) {
+        throw new AppError("Stop-simulation completed but live handoff was not processed", 500);
+    }
+
+    if (handoffResult.liveStartDeferred) {
+        return handoffResult;
+    }
+
+    if (handoffResult.noLiveResult || handoffResult.alreadyLive) {
+        return handoffResult;
+    }
+
     console.log("[SIM-HANDOFF-DEBUG] executeSimulationToLiveHandoff END — live confirmed", { session_id });
     logSimGwTiming("executeSimulationToLiveHandoff EXIT success", {
         session_id,
         totalElapsedMs: simGwElapsedMs(handoffStartedMs),
-        stopPluginTimingMs: stopResponse?.timing_ms ?? null
+        stopPluginTimingMs: handoffResult?.stopResponse?.timing_ms ?? null
     });
 
-    return { stopResponse, liveStartResult };
+    return handoffResult;
 };
 
 const finalizeSimulationHandoff = async (session, handoffResult, extraOutput = {}) => {
@@ -1117,6 +1507,22 @@ const stopSimulation = async (userId, payload = {}) => {
     }
 
     if (session.simulation_live_switch_triggered) {
+        if (session.simulation_status === "live_start_pending") {
+            return buildDeferredLiveStartResponse(
+                session,
+                session.simulation_output?.stop || null,
+                session
+            );
+        }
+
+        if (session.simulation_status === "live_start_in_progress") {
+            return buildLiveStartInProgressResponse(
+                session_id,
+                session,
+                session.simulation_output?.stop || null
+            );
+        }
+
         if (session.simulation_status === "handoff_in_progress") {
             throw new AppError("Simulation live handoff is already in progress", 409);
         }
@@ -1142,7 +1548,7 @@ const stopSimulation = async (userId, payload = {}) => {
             status: "simulation_active",
             simulation_cancel_requested: { $ne: true },
             simulation_live_switch_triggered: { $ne: true },
-            simulation_status: { $nin: ["handoff_in_progress", ...CANCELLED_SIMULATION_STATUSES] }
+            simulation_status: { $nin: [...HANDOFF_BUSY_STATUSES, ...CANCELLED_SIMULATION_STATUSES] }
         },
         {
             $set: {
@@ -1163,6 +1569,26 @@ const stopSimulation = async (userId, payload = {}) => {
                 simulation_status: latestSession?.simulation_status
             });
             return buildSimulationCancelledResponse(session_id, latestSession);
+        }
+
+        if (latestSession?.simulation_status === "live_start_pending") {
+            return buildDeferredLiveStartResponse(
+                session,
+                latestSession.simulation_output?.stop || null,
+                latestSession
+            );
+        }
+
+        if (latestSession?.simulation_status === "live_start_in_progress") {
+            return buildLiveStartInProgressResponse(
+                session_id,
+                latestSession,
+                latestSession.simulation_output?.stop || null
+            );
+        }
+
+        if (latestSession?.simulation_status === "handoff_in_progress") {
+            throw new AppError("Simulation live handoff is already in progress", 409);
         }
 
         throw new AppError("Simulation live handoff is already in progress or session is not active", 409);
@@ -1223,6 +1649,30 @@ const stopSimulation = async (userId, payload = {}) => {
             status: "stopped",
             live_allowed: false,
             message: handoffResult.noLiveResult.message
+        };
+    }
+
+    if (handoffResult.liveStartDeferred) {
+        logSimGwTiming("stopSimulation EXIT live_start_deferred", {
+            session_id,
+            scheduled_after_ist: getLiveStartWindowIstLabel(),
+            stopPluginTimingMs: handoffResult?.stopResponse?.timing_ms ?? null,
+            totalElapsedMs: simGwElapsedMs(endpointStartedMs)
+        });
+        return handoffResult.deferredResponse;
+    }
+
+    if (handoffResult.alreadyLive) {
+        const updatedSession = await TradingSession.findById(session._id).lean();
+        return {
+            session_id,
+            configuration_id: session.saved_configuration_id.toString(),
+            saved_configuration_id: session.saved_configuration_id.toString(),
+            stop: handoffResult.stopResponse,
+            live_trading: handoffResult.liveStartResult || updatedSession?.simulation_output?.live_start || null,
+            status: updatedSession?.status,
+            live_allowed: true,
+            message: "Simulation stopped. Live trading is already active."
         };
     }
 
@@ -1503,11 +1953,17 @@ const startSimulationJobPoller = () => {
         pollIntervalMs: SIMULATION_POLL_INTERVAL_MS,
         pollStartAtIst: `${SIMULATION_POLL_START_HOUR_IST}:${String(SIMULATION_POLL_START_MINUTE_IST).padStart(2, "0")}`,
         autoStopAtIst: `${SIMULATION_AUTO_STOP_HOUR_IST}:${String(SIMULATION_AUTO_STOP_MINUTE_IST).padStart(2, "0")}`,
+        liveStartAtIst: getLiveStartWindowIstLabel(),
+        liveStartPollMs: SIMULATION_LIVE_START_POLL_MS,
         autoStopFromEnv: {
             hour: process.env.SIMULATION_AUTO_STOP_HOUR_IST ?? "(default)",
             minute: process.env.SIMULATION_AUTO_STOP_MINUTE_IST ?? "(default)"
         },
         simulationBaseUrl: SIMULATION_BASE_URL
+    });
+
+    recoverPendingLiveStartTimers().catch((err) => {
+        logger.warn("Initial pending live start timer recovery failed", { error: err.message });
     });
 
     setInterval(() => {
@@ -1522,8 +1978,16 @@ const startSimulationJobPoller = () => {
         });
     }, SIMULATION_POLL_INTERVAL_MS);
 
+    setInterval(() => {
+        recoverPendingLiveStartTimers().catch((err) => {
+            logger.warn("Pending live start timer recovery tick failed", { error: err.message });
+        });
+    }, SIMULATION_LIVE_START_POLL_MS);
+
     logger.info("Bear Street simulation poller started", {
         pollIntervalMs: SIMULATION_POLL_INTERVAL_MS,
+        liveStartPollMs: SIMULATION_LIVE_START_POLL_MS,
+        liveStartAtIst: getLiveStartWindowIstLabel(),
         pollStartIst: `${SIMULATION_POLL_START_HOUR_IST}:${String(SIMULATION_POLL_START_MINUTE_IST).padStart(2, "0")}`,
         simulationBaseUrl: SIMULATION_BASE_URL || "(not configured)"
     });
@@ -1536,10 +2000,13 @@ export {
     applySimulationOutputAndStartLive,
     pollDueSimulationJobs,
     autoStopDueSimulations,
+    recoverPendingLiveStartTimers,
     getSimulationStatus,
     startSimulationJobPoller,
     getTodayTradeDateIst,
-    isSimulationPollWindowOpen
+    isSimulationPollWindowOpen,
+    isLiveStartWindowOpen,
+    getLiveStartWindowIstLabel
 };
 
 export default {
@@ -1549,8 +2016,11 @@ export default {
     applySimulationOutputAndStartLive,
     pollDueSimulationJobs,
     autoStopDueSimulations,
+    recoverPendingLiveStartTimers,
     getSimulationStatus,
     startSimulationJobPoller,
     getTodayTradeDateIst,
-    isSimulationPollWindowOpen
+    isSimulationPollWindowOpen,
+    isLiveStartWindowOpen,
+    getLiveStartWindowIstLabel
 };

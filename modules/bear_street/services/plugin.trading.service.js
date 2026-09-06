@@ -11,7 +11,14 @@ import { buildLiveTradingStartPayload } from "./plugin.payload.util.js";
 import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
 
-const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "2000", 10);
+const SIMULATION_STOP_POST_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POST_TIMEOUT_MS || "20000", 10);
+const SIMULATION_STOP_POLL_INTERVAL_MS = parseInt(process.env.SIMULATION_STOP_POLL_INTERVAL_MS || "2000", 10);
+const SIMULATION_STOP_POLL_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POLL_TIMEOUT_MS || "180000", 10);
+const SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS = parseInt(
+    process.env.SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS || "15000",
+    10
+);
+const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "10000", 10);
 const AUTO_AUTH_PLUGIN_BASE_URL = process.env.BEAR_STREET_PLUGIN_AUTO_AUTH_BASE_URL
     || process.env.PLUGIN_AUTO_AUTH_BASE_URL
     || null;
@@ -56,6 +63,154 @@ const invokeStopSimulationPlugin = async (userId, sessionId, targetBaseUrl, stop
     }
 
     return pluginRes;
+};
+
+const invokeStopSimulationStatus = async (userId, sessionId, targetBaseUrl) => {
+    const pluginRes = await forwardToPlugin(
+        `/api/trading/stop-simulation/${sessionId}/status`,
+        "get",
+        null,
+        { "X-Forwarded-User": userId.toString() },
+        {},
+        { targetBaseUrl, timeoutMs: SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS, retries: 0 }
+    );
+
+    if (!pluginRes?.data || typeof pluginRes.data !== "object") {
+        throw new AppError("Plugin stop-simulation status returned empty or invalid response", 502);
+    }
+
+    return pluginRes.data;
+};
+
+const isStopSimulationJobStopping = (data) =>
+    data?.status === "stopping"
+    || (data?.accepted === true && data?.ready === false);
+
+const isStopSimulationJobFailed = (data) =>
+    data?.status === "failed" || (data?.ready === true && data?.success === false);
+
+const isStopSimulationJobReady = (data) => {
+    if (!data || typeof data !== "object") {
+        return false;
+    }
+
+    if (data.ready === true && data.success !== false) {
+        return true;
+    }
+
+    if (
+        data.success === true
+        && !data.accepted
+        && data.status !== "stopping"
+        && (
+            data.live_allowed !== undefined
+            || data.status === "authenticated"
+            || data.status === "stopped"
+        )
+    ) {
+        return true;
+    }
+
+    return false;
+};
+
+const pollStopSimulationUntilReady = async (userId, sessionId, targetBaseUrl) => {
+    const pollStartedMs = Date.now();
+    let pollCount = 0;
+
+    while (Date.now() - pollStartedMs < SIMULATION_STOP_POLL_TIMEOUT_MS) {
+        pollCount += 1;
+        const statusData = await invokeStopSimulationStatus(userId, sessionId, targetBaseUrl);
+
+        console.log("[SIM-GW-TIMING] stopSimulationTrading poll tick", {
+            sessionId,
+            pollCount,
+            status: statusData?.status,
+            ready: statusData?.ready,
+            live_allowed: statusData?.live_allowed,
+            elapsedMs: Date.now() - pollStartedMs
+        });
+
+        if (isStopSimulationJobFailed(statusData)) {
+            throw new AppError(
+                statusData?.error || statusData?.message || "Simulation stop failed on plugin",
+                502
+            );
+        }
+
+        if (isStopSimulationJobReady(statusData)) {
+            console.log("[SIM-GW-TIMING] stopSimulationTrading poll completed", {
+                sessionId,
+                pollCount,
+                status: statusData?.status,
+                ready: statusData?.ready,
+                live_allowed: statusData?.live_allowed,
+                elapsedMs: Date.now() - pollStartedMs
+            });
+            return statusData;
+        }
+
+        await sleep(SIMULATION_STOP_POLL_INTERVAL_MS);
+    }
+
+    throw new AppError(
+        `Simulation stop did not complete within ${SIMULATION_STOP_POLL_TIMEOUT_MS}ms`,
+        504
+    );
+};
+
+const tryRecoverStopSimulationFromStatus = async (userId, sessionId, targetBaseUrl) => {
+    try {
+        const statusData = await invokeStopSimulationStatus(userId, sessionId, targetBaseUrl);
+
+        if (isStopSimulationJobReady(statusData)) {
+            console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading recovered via status poll", {
+                sessionId,
+                status: statusData?.status,
+                ready: statusData?.ready
+            });
+            return statusData;
+        }
+
+        if (isStopSimulationJobStopping(statusData)) {
+            console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading POST failed but job is stopping — polling", {
+                sessionId,
+                status: statusData?.status,
+                phase: statusData?.phase
+            });
+            return pollStopSimulationUntilReady(userId, sessionId, targetBaseUrl);
+        }
+    } catch (pollErr) {
+        console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading status recovery failed", {
+            sessionId,
+            error: pollErr.message
+        });
+    }
+
+    return null;
+};
+
+const resolveStopSimulationResponse = async (userId, sessionId, targetBaseUrl, pluginRes) => {
+    const data = pluginRes?.data;
+
+    if (isStopSimulationJobReady(data) && !isStopSimulationJobStopping(data)) {
+        return data;
+    }
+
+    if (pluginRes?.status === 202 || isStopSimulationJobStopping(data)) {
+        console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading async accept — polling for completion", {
+            sessionId,
+            httpStatus: pluginRes?.status,
+            pluginStatus: data?.status
+        });
+        return pollStopSimulationUntilReady(userId, sessionId, targetBaseUrl);
+    }
+
+    if (data?.success === true) {
+        return data;
+    }
+
+    throw new AppError("Unexpected stop-simulation response from plugin", 502);
 };
 
 const extractPluginErrorDetail = (err) => {
@@ -430,7 +585,8 @@ const startTrading = async (userId, payload = {}) => {
     return pluginRes ? pluginRes.data : null;
 };
 
-const stopSimulationTrading = async (userId, sessionId) => {
+const stopSimulationTrading = async (userId, sessionId, options = {}) => {
+    const { onStopPollComplete } = options;
     const endpointStartedMs = Date.now();
     console.log("\n[SIM-HANDOFF-DEBUG] stopSimulationTrading START", {
         userId: userId?.toString(),
@@ -440,7 +596,7 @@ const stopSimulationTrading = async (userId, sessionId) => {
         userId: userId?.toString(),
         sessionId,
         pluginPath: `/api/trading/stop-simulation/${sessionId}`,
-        body: "(empty - session_id is path param only; matches plugin TradingConfig-free endpoint)"
+        body: "(empty — session_id is path param only; matches plugin TradingConfig-free endpoint)"
     });
 
     logger.info("Stopping Bear Street simulation worker", { userId, sessionId });
@@ -458,40 +614,69 @@ const stopSimulationTrading = async (userId, sessionId) => {
         sessionLookupMs: Date.now() - lookupStartedMs
     });
 
-    const stopRequestTimeoutMs = parseInt(process.env.SIMULATION_STOP_REQUEST_TIMEOUT || "120000", 10);
+    const stopPostTimeoutMs = parseInt(
+        process.env.SIMULATION_STOP_POST_TIMEOUT_MS || String(SIMULATION_STOP_POST_TIMEOUT_MS),
+        10
+    );
     const pluginCallStartedMs = Date.now();
 
     let pluginRes = null;
     let attempt = 1;
+    let stopResponse = null;
 
     try {
         pluginRes = await invokeStopSimulationPlugin(
             userId,
             sessionId,
             targetBaseUrl,
-            stopRequestTimeoutMs
+            stopPostTimeoutMs
         );
-    } catch (firstErr) {
-        if (!isTransientStopSimulationFailure(firstErr)) {
-            throw firstErr;
-        }
-
-        console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading transient failure - retrying once", {
-            sessionId,
-            attempt: 1,
-            error: firstErr.message,
-            statusCode: firstErr.statusCode || firstErr.response?.status || null,
-            retryDelayMs: SIMULATION_STOP_RETRY_DELAY_MS
-        });
-
-        await sleep(SIMULATION_STOP_RETRY_DELAY_MS);
-        attempt = 2;
-        pluginRes = await invokeStopSimulationPlugin(
+        stopResponse = await resolveStopSimulationResponse(
             userId,
             sessionId,
             targetBaseUrl,
-            stopRequestTimeoutMs
+            pluginRes
         );
+    } catch (firstErr) {
+        const recovered = await tryRecoverStopSimulationFromStatus(userId, sessionId, targetBaseUrl);
+        if (recovered) {
+            stopResponse = recovered;
+        } else if (!isTransientStopSimulationFailure(firstErr)) {
+            throw firstErr;
+        } else {
+            console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading transient failure — poll then retry POST", {
+                sessionId,
+                attempt: 1,
+                error: firstErr.message,
+                statusCode: firstErr.statusCode || firstErr.response?.status || null,
+                retryDelayMs: SIMULATION_STOP_RETRY_DELAY_MS
+            });
+
+            await sleep(SIMULATION_STOP_RETRY_DELAY_MS);
+            attempt = 2;
+
+            const recoveredAfterDelay = await tryRecoverStopSimulationFromStatus(
+                userId,
+                sessionId,
+                targetBaseUrl
+            );
+            if (recoveredAfterDelay) {
+                stopResponse = recoveredAfterDelay;
+            } else {
+                pluginRes = await invokeStopSimulationPlugin(
+                    userId,
+                    sessionId,
+                    targetBaseUrl,
+                    stopPostTimeoutMs
+                );
+                stopResponse = await resolveStopSimulationResponse(
+                    userId,
+                    sessionId,
+                    targetBaseUrl,
+                    pluginRes
+                );
+            }
+        }
     }
 
     const pluginRoundTripMs = Date.now() - pluginCallStartedMs;
@@ -499,23 +684,28 @@ const stopSimulationTrading = async (userId, sessionId) => {
     console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading plugin response", {
         sessionId,
         attempt,
-        status: pluginRes?.status,
-        data: pluginRes?.data
+        httpStatus: pluginRes?.status ?? null,
+        pluginStatus: stopResponse?.status,
+        ready: stopResponse?.ready
     });
     console.log("[SIM-GW-TIMING] stopSimulationTrading plugin HTTP done", {
         sessionId,
         attempt,
         pluginRoundTripMs,
-        pluginTimingMs: pluginRes?.data?.timing_ms ?? null,
-        success: pluginRes?.data?.success,
-        live_allowed: pluginRes?.data?.live_allowed,
-        configuration_id: pluginRes?.data?.configuration_id ?? null,
-        trading_status: pluginRes?.data?.trading_status ?? null,
-        pyramid_reason: pluginRes?.data?.pyramid?.reason ?? null,
+        pluginTimingMs: stopResponse?.timing_ms ?? pluginRes?.data?.timing_ms ?? null,
+        success: stopResponse?.success,
+        live_allowed: stopResponse?.live_allowed,
+        configuration_id: stopResponse?.configuration_id ?? null,
+        trading_status: stopResponse?.trading_status ?? null,
+        pyramid_reason: stopResponse?.pyramid?.reason ?? null,
         totalElapsedMs: Date.now() - endpointStartedMs
     });
 
-    return pluginRes.data;
+    if (typeof onStopPollComplete === "function") {
+        await onStopPollComplete(stopResponse);
+    }
+
+    return stopResponse;
 };
 
 const stopTrading = async (userId, sessionId) => {
