@@ -779,6 +779,30 @@ const applySimulationOutputAndStartLive = async (session, jobResult = null) => {
         throw err;
     }
 
+    if (handoffResult.noLiveResult) {
+        return handoffResult.noLiveResult;
+    }
+
+    if (handoffResult.liveStartDeferred) {
+        logger.info("Simulation handoff deferred until live start window", {
+            sessionId: session.python_session_id,
+            scheduledAfterIst: getLiveStartWindowIstLabel()
+        });
+        return handoffResult.deferredResponse;
+    }
+
+    if (handoffResult.alreadyLive) {
+        return {
+            session_id: session.python_session_id,
+            configuration_id: savedConfiguration._id.toString(),
+            saved_configuration_id: savedConfiguration._id.toString(),
+            stop: handoffResult.stopResponse,
+            live_trading: handoffResult.liveStartResult || null,
+            live_allowed: true,
+            message: "Simulation stopped. Live trading is already active."
+        };
+    }
+
     await finalizeSimulationHandoff(session, handoffResult, jobResult ? { external_job: jobResult } : {});
 
     logger.info("Simulation handoff complete; live trading started", {
@@ -1852,7 +1876,7 @@ const autoStopDueSimulations = async () => {
         broker: BROKER_KEY,
         status: "simulation_active",
         simulation_cancel_requested: { $ne: true },
-        simulation_status: { $nin: ["handoff_in_progress", ...CANCELLED_SIMULATION_STATUSES] },
+        simulation_status: { $nin: ["handoff_in_progress", ...LIVE_START_PENDING_STATUSES, ...CANCELLED_SIMULATION_STATUSES] },
         simulation_trade_date: today
     }).sort({ simulation_started_at: 1 });
 
