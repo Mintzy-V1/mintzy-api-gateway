@@ -381,8 +381,8 @@ const stopSession = catchAsync(async (req, res) => {
 const abandonSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     httpCache.invalidateUser(userId);
-    httpCache.invalidateSession(sessionId);
-    const { sessionId } = req.params; // python_session_id
+    const { sessionId } = req.params;
+    httpCache.invalidateSession(sessionId); // python_session_id
 
     const ts = await TradingSession.findOne({ python_session_id: sessionId, user_id: userId });
     if (!ts) throw new AppError("Session not found", 404);
@@ -392,6 +392,9 @@ const abandonSession = catchAsync(async (req, res) => {
     ts.ended_at = new Date();
     await ts.save();
     dataService.stopLivePnlSnapshotMonitor(sessionId, ts.user_id);
+    dataService.markPluginSessionAbandoned(sessionId).catch((err) =>
+        logger.warn('Failed to mark plugin session abandoned', { sessionId, error: err.message })
+    );
     scheduledStartService.clearScheduledStart(sessionId);
 
     res.status(200).json({ success: true, message: "Session abandoned" });
@@ -584,8 +587,8 @@ const downloadFinalTradebook = catchAsync(async (req, res) => {
 const adminStopSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     httpCache.invalidateUser(userId);
-    httpCache.invalidateSession(sessionId);
     const { sessionId } = req.params;
+    httpCache.invalidateSession(sessionId);
     const result = await adminService.adminStopSession(userId, sessionId);
 
     dataService.saveFinalPnlSnapshot(sessionId).catch(err =>

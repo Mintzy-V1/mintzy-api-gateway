@@ -239,8 +239,8 @@ const startTrading = catchAsync(async (req, res) => {
 const stopTradingBySessionId = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     httpCache.invalidateUser(userId);
-    httpCache.invalidateSession(sessionId);
     const { sessionId } = req.params;
+    httpCache.invalidateSession(sessionId);
     const result = await tradingService.stopTrading(userId, sessionId);
     dataService.saveFinalPnlSnapshot(sessionId).catch((err) =>
         logger.warn("Final PnL snapshot failed on stop", { sessionId, error: err.message })
@@ -290,6 +290,9 @@ const abandonSession = catchAsync(async (req, res) => {
     ts.ended_at = new Date();
     await ts.save();
     dataService.stopLivePnlSnapshotMonitor(sessionId, ts.user_id);
+    dataService.markPluginSessionAbandoned(sessionId).catch((err) =>
+        logger.warn('Failed to mark plugin session abandoned', { sessionId, error: err.message })
+    );
     scheduledStartService.clearScheduledStart(sessionId);
 
     res.status(200).json({ success: true, message: "Session abandoned" });
@@ -535,8 +538,8 @@ const downloadAdminTradingLogsByUser = catchAsync(async (req, res) => {
 const adminStopSession = catchAsync(async (req, res) => {
     const userId = getRequestUserId(req);
     httpCache.invalidateUser(userId);
-    httpCache.invalidateSession(sessionId);
     const { sessionId } = req.params;
+    httpCache.invalidateSession(sessionId);
     const result = await adminService.adminStopSession(userId, sessionId);
     dataService.saveFinalPnlSnapshot(sessionId).catch((err) =>
         logger.warn("Final PnL snapshot failed on force stop", { sessionId, error: err.message })

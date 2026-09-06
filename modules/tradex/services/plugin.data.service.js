@@ -835,6 +835,31 @@ const markPluginSessionStopped = async (sessionId, metadata = {}) => {
     return result?.value || result;
 };
 
+const markPluginSessionAbandoned = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
+    const abandonedAt = metadata.abandoned_at ? new Date(metadata.abandoned_at) : new Date();
+    const db = getPluginDb();
+    const collection = db.collection("plugin_sessions");
+
+    const result = await collection.findOneAndUpdate(
+        { session_id: sessionId },
+        {
+            $set: {
+                status: "abandoned",
+                trading_status: metadata.trading_status || "abandoned",
+                stopped: true,
+                ended_at: abandonedAt,
+                stopped_at: abandonedAt,
+                updated_at: abandonedAt,
+                worker_pid: null,
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    return result?.value || result;
+};
+
 /**
  * Debug helper: mark a plugin DB session as stopped without touching the
  * trading engine. This is intentionally only for manual recovery/testing.
@@ -1423,6 +1448,7 @@ export {
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
+    markPluginSessionAbandoned,
     debugStopPluginSession,
     getDashboardState,
     getTradingPnlSummary,
@@ -1451,6 +1477,7 @@ export default {
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
+    markPluginSessionAbandoned,
     debugStopPluginSession,
     getDashboardState,
     getTradingPnlSummary,
