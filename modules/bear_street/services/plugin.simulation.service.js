@@ -611,6 +611,9 @@ const startSimulation = async (userId, payload = {}) => {
     ts.configuration_name = savedConfiguration.name;
     ts.trading_configuration = mergedConfiguration;
     await ts.save();
+    dataService.markPluginSessionSimulationActive(session_id, { simulation_started_at: ts.simulation_started_at }).catch((err) =>
+        logger.warn('Failed to mark plugin session simulation_active', { sessionId: session_id, error: err.message })
+    );
     dataService.startLivePnlSnapshotMonitor(ts.user_id, ts.python_session_id);
 
     logSimGwTiming("startSimulation EXIT success", {

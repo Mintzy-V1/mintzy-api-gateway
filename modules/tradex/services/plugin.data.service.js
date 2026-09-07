@@ -835,6 +835,29 @@ const markPluginSessionStopped = async (sessionId, metadata = {}) => {
     return result?.value || result;
 };
 
+const markPluginSessionSimulationActive = async (sessionId, metadata = {}) => {
+    httpCache.invalidateSession(sessionId);
+    const now = new Date();
+    const db = getPluginDb();
+    const collection = db.collection("plugin_sessions");
+
+    const result = await collection.findOneAndUpdate(
+        { session_id: sessionId },
+        {
+            $set: {
+                status: "simulation_active",
+                trading_status: metadata.trading_status || "simulation",
+                simulation: true,
+                simulation_started_at: metadata.simulation_started_at || now,
+                updated_at: now,
+            }
+        },
+        { returnDocument: "after" }
+    );
+
+    return result?.value || result;
+};
+
 const markPluginSessionAbandoned = async (sessionId, metadata = {}) => {
     httpCache.invalidateSession(sessionId);
     const abandonedAt = metadata.abandoned_at ? new Date(metadata.abandoned_at) : new Date();
@@ -1448,6 +1471,7 @@ export {
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
+    markPluginSessionSimulationActive,
     markPluginSessionAbandoned,
     debugStopPluginSession,
     getDashboardState,
@@ -1477,6 +1501,7 @@ export default {
     markPluginSessionAuthenticated,
     markPluginSessionTradingActive,
     markPluginSessionStopped,
+    markPluginSessionSimulationActive,
     markPluginSessionAbandoned,
     debugStopPluginSession,
     getDashboardState,
