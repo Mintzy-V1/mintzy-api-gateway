@@ -222,6 +222,47 @@ const assertOutsideMarketHours = () => {
   }
 };
 
+/**
+ * The clock guard is not sufficient on its own. Both pollers act on every session,
+ * and isLiveStartWindowOpen() is one-sided — it stays true for the rest of the day
+ * after 13:00:05. Running this in the evening with a real session left at
+ * live_start_pending would start live trading at night. Likewise a real schedule
+ * still pending for today has a start_at in the past and would be fired for real.
+ *
+ * So refuse outright if any real session is in a state the pollers would touch.
+ * This is deliberately not bypassable with --force.
+ */
+const assertNoRealWorkPending = async () => {
+  const notRehearsal = { $not: { $regex: `^${REHEARSAL_TAG}` } };
+
+  const dueSchedules = await TradingSession.find({
+    python_session_id: notRehearsal,
+    "scheduled_start.status": { $in: ["pending", "firing"] },
+    "scheduled_start.start_at": { $lte: new Date() }
+  }).select("python_session_id scheduled_start.status").lean();
+
+  const liveStarts = await TradingSession.find({
+    python_session_id: notRehearsal,
+    simulation_status: { $in: ["live_start_pending", "live_start_in_progress"] },
+    simulation_trade_date: istDateKey()
+  }).select("python_session_id simulation_status").lean();
+
+  if (dueSchedules.length === 0 && liveStarts.length === 0) return;
+
+  console.error("Refusing to run: real sessions are in a state the pollers would act on.\n");
+  for (const s of dueSchedules) {
+    console.error(`  due schedule   ${s.python_session_id} (${s.scheduled_start?.status})`);
+  }
+  for (const s of liveStarts) {
+    console.error(`  live start     ${s.python_session_id} (${s.simulation_status})`);
+  }
+  console.error(
+    "\nDriving the pollers now would fire these for real, outside market hours.\n" +
+    "Clear them first:  python scripts/preopen_audit.py --fix"
+  );
+  process.exit(2);
+};
+
 const main = async () => {
   if (!process.env.MONGO_URI) {
     console.error("MONGO_URI is not set — run this from the gateway host with its env loaded.");
@@ -231,6 +272,7 @@ const main = async () => {
   assertOutsideMarketHours();
 
   await connectDB();
+  await assertNoRealWorkPending();
   await cleanup();
 
   try {
