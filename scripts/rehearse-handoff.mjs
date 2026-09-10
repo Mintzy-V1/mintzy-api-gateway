@@ -185,16 +185,20 @@ const auditTodaysSessions = async () => {
     );
   }
 
-  const vmCounts = new Map();
+  // Count distinct users per VM, not sessions: one account legitimately having
+  // several sessions on its own VM is not a sharing problem.
+  const usersByVm = new Map();
   for (const s of sessions) {
-    if (s.vm_url) vmCounts.set(s.vm_url, (vmCounts.get(s.vm_url) || 0) + 1);
+    if (!s.vm_url) continue;
+    if (!usersByVm.has(s.vm_url)) usersByVm.set(s.vm_url, new Set());
+    usersByVm.get(s.vm_url).add(String(s.user_id));
   }
-  const shared = [...vmCounts.entries()].filter(([, n]) => n > 1);
+  const shared = [...usersByVm.entries()].filter(([, users]) => users.size > 1);
 
   check("every session has vm_url set", missingVm.length === 0,
     missingVm.length ? `${missingVm.length} session(s) would fall back to the default VM` : "");
-  check("no two accounts share a VM", shared.length === 0,
-    shared.length ? shared.map(([url, n]) => `${url} x${n}`).join(", ") : "");
+  check("no VM is shared by two accounts", shared.length === 0,
+    shared.length ? shared.map(([url, users]) => `${url} used by ${users.size} users`).join("; ") : "");
 };
 
 /**
