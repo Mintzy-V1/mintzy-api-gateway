@@ -13,6 +13,10 @@ import logger from "../config/logger.js";
 import { buildLiveTradingStartPayload } from "./plugin.payload.util.js";
 
 const LIVE_TRADING_ACTIVE_STATUSES = ["trading_active", "running", "started"];
+
+// The plugin's live-start path blocks up to 90s inside prepare_for_live_start, so the
+// default 60s proxy timeout would abandon a request the plugin is still servicing.
+const TRADING_START_TIMEOUT_MS = parseInt(process.env.PLUGIN_TRADING_START_TIMEOUT_MS || "120000", 10);
 const SIMULATION_STOP_POST_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POST_TIMEOUT_MS || "20000", 10);
 const SIMULATION_STOP_POLL_INTERVAL_MS = parseInt(process.env.SIMULATION_STOP_POLL_INTERVAL_MS || "2000", 10);
 const SIMULATION_STOP_POLL_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POLL_TIMEOUT_MS || "180000", 10);
@@ -522,12 +526,16 @@ const startTrading = async (userId, payload = {}) => {
                 startPayload,
                 { "X-Forwarded-User": userId.toString() },
                 {},
-                { targetBaseUrl }
+                // Starting is not idempotent: a proxy-level retry can spawn a second
+                // live worker on the same session. Recovery is handled below instead.
+                { targetBaseUrl, timeoutMs: TRADING_START_TIMEOUT_MS, retries: 0 }
             );
         } catch (err) {
             const detail = extractPluginErrorDetail(err);
 
-            if (detail.toLowerCase().includes("already running")) {
+            // Any failure here — "already running", a timeout, a dropped connection —
+            // can still leave the plugin live, so confirm before treating it as failed.
+            {
                 for (let attempt = 1; attempt <= 5; attempt += 1) {
                     await sleep(1000 * attempt);
 
