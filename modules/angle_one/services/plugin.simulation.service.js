@@ -34,13 +34,18 @@ const SIMULATION_LIVE_START_SECOND_IST = parseInt(process.env.SIMULATION_LIVE_ST
 const SIMULATION_LIVE_START_POLL_MS = parseInt(process.env.SIMULATION_LIVE_START_POLL_MS || "5000", 10);
 const SIMULATION_REQUEST_TIMEOUT = parseInt(process.env.SIMULATION_REQUEST_TIMEOUT || "60000", 10);
 
+const LIVE_START_STUCK_MS = parseInt(process.env.LIVE_START_STUCK_MS || "300000", 10);
+const AUTO_STOP_CONCURRENCY = Math.max(
+    1,
+    parseInt(process.env.SIMULATION_AUTO_STOP_CONCURRENCY || "8", 10)
+);
+
 const ACTIVE_SIMULATION_STATUSES = ["pending", "running", "started"];
 const CANCELLED_SIMULATION_STATUSES = ["cancelling", "cancelled"];
 const LIVE_START_PENDING_STATUSES = ["live_start_pending", "live_start_in_progress"];
 const HANDOFF_BUSY_STATUSES = ["handoff_in_progress", ...LIVE_START_PENDING_STATUSES];
 let pollerStarted = false;
 let pollInProgress = false;
-let lastAutoStopDateKey = null;
 /** @type {Map<string, NodeJS.Timeout>} session_id -> per-session live-start timer */
 const scheduledLiveStartTimers = new Map();
 
@@ -1008,7 +1013,8 @@ const claimLiveStartLock = async (session, userId) => {
         },
         {
             $set: {
-                simulation_status: "live_start_in_progress"
+                simulation_status: "live_start_in_progress",
+                live_start_claimed_at: new Date()
             }
         },
         { returnDocument: "after" }
@@ -1029,7 +1035,7 @@ const releaseLiveStartLockToPending = async (sessionId, errorMessage = null) => 
             _id: sessionId,
             simulation_status: "live_start_in_progress"
         },
-        { $set: update }
+        { $set: update, $unset: { live_start_claimed_at: "" } }
     );
 };
 
@@ -1189,7 +1195,44 @@ const scheduleLiveStartTimer = (userId, session, stopResponse) => {
     scheduledLiveStartTimers.set(session_id, timer);
 };
 
+/**
+ * A live start claimed by a process that then died stays "live_start_in_progress"
+ * forever: claimLiveStartLock only accepts handoff_in_progress/live_start_pending,
+ * so nothing can pick it back up. Return stale claims to pending so the normal
+ * recovery path retries them. The age cut-off must exceed the longest legitimate
+ * start (the plugin can block ~120s) so a healthy run is never double-fired.
+ */
+const reapStaleLiveStartClaims = async (broker) => {
+    const cutoff = new Date(Date.now() - LIVE_START_STUCK_MS);
+    const result = await TradingSession.updateMany(
+        {
+            broker,
+            simulation_status: "live_start_in_progress",
+            simulation_cancel_requested: { $ne: true },
+            simulation_trade_date: getTodayTradeDateIst(),
+            $or: [
+                { live_start_claimed_at: { $lte: cutoff } },
+                { live_start_claimed_at: { $exists: false } },
+                { live_start_claimed_at: null }
+            ]
+        },
+        {
+            $set: {
+                simulation_status: "live_start_pending",
+                "simulation_output.live_start_last_error": "reclaimed after live start was abandoned mid-flight"
+            },
+            $unset: { live_start_claimed_at: "" }
+        }
+    );
+
+    if (result.modifiedCount > 0) {
+        logger.warn("Reclaimed stale live-start claims", { broker, count: result.modifiedCount });
+    }
+};
+
 const recoverPendingLiveStartTimers = async () => {
+    await reapStaleLiveStartClaims("angle_one");
+
     const today = getTodayTradeDateIst();
     const sessions = await TradingSession.find({
         broker: "angle_one",
@@ -1870,15 +1913,15 @@ const autoStopDueSimulations = async () => {
         return;
     }
 
-    if (lastAutoStopDateKey === today) {
-        return;
-    }
-
+    // No process-wide "already ran today" flag: it would skip every session that
+    // begins its simulation after the first auto-stop of the day, leaving those
+    // accounts running past 12:59 and never switching to live. The query below is
+    // already idempotent — a stopped session leaves status "simulation_active".
     const sessions = await TradingSession.find({
         broker: "angle_one",
         status: "simulation_active",
         simulation_cancel_requested: { $ne: true },
-        simulation_status: { $nin: ["handoff_in_progress", ...LIVE_START_PENDING_STATUSES, ...CANCELLED_SIMULATION_STATUSES] },
+        simulation_status: { $nin: ["handoff_in_progress", "stop_failed_vm_unavailable", ...LIVE_START_PENDING_STATUSES, ...CANCELLED_SIMULATION_STATUSES] },
         simulation_trade_date: today
     }).sort({ simulation_started_at: 1 });
 
@@ -1899,15 +1942,17 @@ const autoStopDueSimulations = async () => {
         return;
     }
 
-    lastAutoStopDateKey = today;
-
     logger.info("Simulation auto-stop triggered", {
         tradeDate: today,
         sessionCount: sessions.length,
         stopAtIst: `${SIMULATION_AUTO_STOP_HOUR_IST}:${String(SIMULATION_AUTO_STOP_MINUTE_IST).padStart(2, "0")}`
     });
 
-    for (const session of sessions) {
+    // Stopping sequentially spends each session's full stop budget before the next
+    // one starts, so with several accounts the later ones miss the 13:00:05 live
+    // start and go live staggered at different prices. Sessions are independent and
+    // live on their own VMs, so stop them together.
+    const stopOne = async (session) => {
         try {
             console.log("[SIM-POLLER-DEBUG] autoStop calling stopSimulation", {
                 sessionId: session.python_session_id,
@@ -1933,6 +1978,16 @@ const autoStopDueSimulations = async () => {
                 error: err.message
             });
         }
+    };
+
+    // Bounded so an unexpectedly large batch can't flood a shared plugin host.
+    for (let i = 0; i < sessions.length; i += AUTO_STOP_CONCURRENCY) {
+        const batch = sessions.slice(i, i + AUTO_STOP_CONCURRENCY);
+        logSimGwTiming("autoStop batch", {
+            batch: batch.map((s) => s.python_session_id),
+            concurrency: AUTO_STOP_CONCURRENCY
+        });
+        await Promise.allSettled(batch.map(stopOne));
     }
 };
 

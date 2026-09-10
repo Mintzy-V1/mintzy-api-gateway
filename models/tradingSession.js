@@ -16,7 +16,15 @@ const tradingSessionSchema = new mongoose.Schema({
   simulation_job_id: { type: String },
   simulation_status: {
     type: String,
-    enum: ['pending', 'running', 'started', 'completed', 'failed', 'handoff_in_progress', 'handoff_failed', 'cancelling', 'cancelled'],
+    // Mongoose validates every DB-hydrated path on save(), not just modified ones,
+    // so any value written at runtime must be listed here or the next save() throws.
+    enum: [
+      'pending', 'running', 'started', 'completed', 'failed',
+      'handoff_in_progress', 'handoff_failed', 'cancelling', 'cancelled',
+      'live_start_pending', 'live_start_in_progress', 'stop_failed_vm_unavailable',
+      // No longer written, but ~62 documents from Aug 2026 still carry it.
+      'stopped'
+    ],
     default: undefined
   },
   simulation_started_at: { type: Date },
@@ -24,15 +32,18 @@ const tradingSessionSchema = new mongoose.Schema({
   simulation_cancel_requested: { type: Boolean, default: false },
   simulation_live_switch_triggered: { type: Boolean, default: false },
   simulation_live_started_at: { type: Date },
+  live_start_claimed_at: { type: Date },
   simulation_trade_date: { type: String },
   simulation_output: { type: mongoose.Schema.Types.Mixed },
   scheduled_start: {
     payload: { type: mongoose.Schema.Types.Mixed },
     start_at: { type: Date },
+    trade_date: { type: String },
     status: { type: String, enum: ['pending', 'firing', 'fired', 'failed', 'cancelled'] },
     attempts: { type: Number, default: 0 },
     error: { type: String },
     created_at: { type: Date },
+    firing_at: { type: Date },
     fired_at: { type: Date }
   }
 });

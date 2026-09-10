@@ -8,6 +8,9 @@ const START_HOUR = parseInt(process.env.SIMULATION_START_HOUR_IST || "10", 10);
 const START_MINUTE = parseInt(process.env.SIMULATION_START_MINUTE_IST || "30", 10);
 const POLL_INTERVAL_MS = parseInt(process.env.SCHEDULED_START_POLL_INTERVAL_MS || "30000", 10);
 const MAX_ATTEMPTS = 3;
+// A claim that has sat in "firing" longer than this belongs to a process that
+// died mid-fire; nothing else ever moves it out of that state.
+const FIRING_STUCK_MS = parseInt(process.env.SCHEDULED_START_FIRING_STUCK_MS || "300000", 10);
 
 const CONFIGURABLE_STATUSES = ["authenticated"];
 
@@ -45,6 +48,15 @@ const startAtForToday = () => {
   );
 };
 
+const istDateKey = (date = new Date()) => {
+  const { year, month, day } = istParts(date);
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+};
+
+// Schedules written before trade_date existed still need a day to compare against.
+const scheduledTradeDate = (scheduled) =>
+  scheduled?.trade_date || (scheduled?.start_at ? istDateKey(new Date(scheduled.start_at)) : null);
+
 /**
  * If the session start request arrives before 10:30 AM IST, persist it on the
  * TradingSession doc so a background poller fires it at 10:30 — even if the
@@ -64,6 +76,7 @@ const maybeScheduleStart = async (userId, payload) => {
   const scheduledStart = {
     payload,
     start_at: startAt,
+    trade_date: istDateKey(startAt),
     status: "pending",
     attempts: 0,
     created_at: new Date()
@@ -95,7 +108,49 @@ const startBrokerTrading = async (ts, payload) => {
   return angleOneStartSimulation(userId, payload);
 };
 
+/**
+ * Return claims abandoned by a process that died between claiming and recording
+ * the outcome. Without this they stay "firing" forever and the start never happens.
+ */
+const reapStuckFiringClaims = async () => {
+  const cutoff = new Date(Date.now() - FIRING_STUCK_MS);
+  const stuck = await TradingSession.find({
+    "scheduled_start.status": "firing",
+    $or: [
+      { "scheduled_start.firing_at": { $lte: cutoff } },
+      { "scheduled_start.firing_at": { $exists: false } },
+      { "scheduled_start.firing_at": null }
+    ]
+  })
+    .select("_id python_session_id scheduled_start")
+    .lean();
+
+  for (const ts of stuck) {
+    const attempts = (ts.scheduled_start?.attempts || 0) + 1;
+    const status = attempts >= MAX_ATTEMPTS ? "failed" : "pending";
+    await TradingSession.updateOne(
+      { _id: ts._id, "scheduled_start.status": "firing" },
+      {
+        $set: {
+          "scheduled_start.status": status,
+          "scheduled_start.attempts": attempts,
+          "scheduled_start.error": "reclaimed after fire was abandoned mid-flight"
+        },
+        $unset: { "scheduled_start.firing_at": "" }
+      }
+    );
+    console.warn("[SCHEDULED-START] reclaimed stuck claim", {
+      sessionId: ts.python_session_id,
+      attempts,
+      status
+    });
+  }
+};
+
 const fireDueScheduledStarts = async () => {
+  await reapStuckFiringClaims();
+
+  const today = istDateKey();
   const due = await TradingSession.find({
     "scheduled_start.status": "pending",
     "scheduled_start.start_at": { $lte: new Date() }
@@ -104,6 +159,22 @@ const fireDueScheduledStarts = async () => {
     .lean();
 
   for (const ts of due) {
+    // A schedule left over from an earlier day would otherwise fire the moment
+    // the gateway restarts, starting trading at an arbitrary time.
+    const tradeDate = scheduledTradeDate(ts.scheduled_start);
+    if (tradeDate !== today) {
+      await TradingSession.updateOne(
+        { _id: ts._id, "scheduled_start.status": "pending" },
+        { $set: { "scheduled_start.status": "cancelled", "scheduled_start.error": `stale schedule for ${tradeDate || "unknown date"}` } }
+      );
+      console.warn("[SCHEDULED-START] cancelled stale schedule", {
+        sessionId: ts.python_session_id,
+        tradeDate,
+        today
+      });
+      continue;
+    }
+
     if (!CONFIGURABLE_STATUSES.includes(ts.status)) {
       await TradingSession.updateOne(
         { _id: ts._id, "scheduled_start.status": "pending" },
@@ -114,7 +185,7 @@ const fireDueScheduledStarts = async () => {
 
     const claimed = await TradingSession.findOneAndUpdate(
       { _id: ts._id, "scheduled_start.status": "pending" },
-      { $set: { "scheduled_start.status": "firing" } },
+      { $set: { "scheduled_start.status": "firing", "scheduled_start.firing_at": new Date() } },
       { new: true }
     );
     if (!claimed) continue;
@@ -128,7 +199,8 @@ const fireDueScheduledStarts = async () => {
             "scheduled_start.status": "fired",
             "scheduled_start.fired_at": new Date(),
             "scheduled_start.attempts": (claimed.scheduled_start.attempts || 0) + 1
-          }
+          },
+          $unset: { "scheduled_start.firing_at": "" }
         }
       );
       console.log("[SCHEDULED-START] fired", { sessionId: ts.python_session_id });
@@ -142,7 +214,8 @@ const fireDueScheduledStarts = async () => {
             "scheduled_start.status": status,
             "scheduled_start.attempts": attempts,
             "scheduled_start.error": err.message
-          }
+          },
+          $unset: { "scheduled_start.firing_at": "" }
         }
       );
       console.warn("[SCHEDULED-START] fire attempt failed", {
@@ -178,16 +251,20 @@ export {
   maybeScheduleStart,
   clearScheduledStart,
   fireDueScheduledStarts,
+  reapStuckFiringClaims,
   startScheduledStartPoller,
   isBeforeSimulationStart,
-  startAtForToday
+  startAtForToday,
+  istDateKey
 };
 
 export default {
   maybeScheduleStart,
   clearScheduledStart,
   fireDueScheduledStarts,
+  reapStuckFiringClaims,
   startScheduledStartPoller,
   isBeforeSimulationStart,
-  startAtForToday
+  startAtForToday,
+  istDateKey
 };
