@@ -495,17 +495,21 @@ const startTrading = async (userId, payload = {}) => {
                 startPayload,
                 { "X-Forwarded-User": userId.toString() },
                 {},
+                // Starting is not idempotent: a proxy-level retry can spawn a second
+                // live worker on the same session. Recovery is handled below instead.
                 { targetBaseUrl, timeoutMs: TRADING_START_TIMEOUT_MS, retries: 0 }
             );
         } catch (err) {
             const detail = extractPluginErrorDetail(err);
 
-            if (detail.toLowerCase().includes("already running")) {
-                console.log("[SIM-HANDOFF-DEBUG] startTrading already-running - polling for live confirmation", {
+            // Any failure here — "already running", a timeout, a dropped connection —
+            // can still leave the plugin live, so confirm before treating it as failed.
+            {
+                console.log("[SIM-HANDOFF-DEBUG] startTrading errored — polling for live confirmation", {
                     session_id,
                     detail
                 });
-                logger.info("Firstock plugin reported already running; polling for live confirmation", {
+                logger.info("Firstock live start errored; polling for live confirmation", {
                     userId,
                     session_id,
                     detail
