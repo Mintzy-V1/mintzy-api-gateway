@@ -12,6 +12,7 @@ import AppError from "../utils/AppError.js";
 import logger from "../config/logger.js";
 
 const SIMULATION_STOP_POST_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POST_TIMEOUT_MS || "20000", 10);
+const TRADING_START_TIMEOUT_MS = parseInt(process.env.PLUGIN_TRADING_START_TIMEOUT_MS || "120000", 10);
 const SIMULATION_STOP_POLL_INTERVAL_MS = parseInt(process.env.SIMULATION_STOP_POLL_INTERVAL_MS || "2000", 10);
 const SIMULATION_STOP_POLL_TIMEOUT_MS = parseInt(process.env.SIMULATION_STOP_POLL_TIMEOUT_MS || "180000", 10);
 const SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS = parseInt(
@@ -494,7 +495,7 @@ const startTrading = async (userId, payload = {}) => {
                 startPayload,
                 { "X-Forwarded-User": userId.toString() },
                 {},
-                { targetBaseUrl }
+                { targetBaseUrl, timeoutMs: TRADING_START_TIMEOUT_MS, retries: 0 }
             );
         } catch (err) {
             const detail = extractPluginErrorDetail(err);
