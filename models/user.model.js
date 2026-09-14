@@ -24,7 +24,7 @@ const userSchema = new mongoose.Schema({
 
   broker:{
         type:String,
-        enum:["angle one","tradex","bear_street"],
+        enum:["angle one","tradex","bear_street","firstock"],
         default:null
     },
 

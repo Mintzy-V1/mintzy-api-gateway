@@ -2,6 +2,7 @@ import TradingSession from "../models/tradingSession.js";
 import { startSimulation as angleOneStartSimulation } from "../modules/angle_one/services/plugin.simulation.service.js";
 import { startSimulation as tradexStartSimulation } from "../modules/tradex/services/plugin.simulation.service.js";
 import { startSimulation as bearStreetStartSimulation } from "../modules/bear_street/services/plugin.simulation.service.js";
+import { startSimulation as firstockStartSimulation } from "../modules/firstock/services/plugin.simulation.service.js";
 
 const IST = "Asia/Kolkata";
 const START_HOUR = parseInt(process.env.SIMULATION_START_HOUR_IST || "10", 10);
@@ -105,6 +106,7 @@ const startBrokerTrading = async (ts, payload) => {
   const broker = String(ts.broker || "").toLowerCase();
   if (broker === "tradex") return tradexStartSimulation(userId, payload);
   if (broker === "bear_street") return bearStreetStartSimulation(userId, payload);
+  if (broker === "firstock") return firstockStartSimulation(userId, payload);
   return angleOneStartSimulation(userId, payload);
 };
 

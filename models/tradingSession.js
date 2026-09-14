@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 const tradingSessionSchema = new mongoose.Schema({
   user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   python_session_id: { type: String },
-  broker: { type: String, enum: ['angle_one', 'tradex', 'bear_street'], index: true },
+  broker: { type: String, enum: ['angle_one', 'tradex', 'bear_street', 'firstock'], index: true },
   status: { type: String, default: 'created' },
   vm_url: { type: String },
   auto_auth_on_credentials: { type: Boolean, default: false },

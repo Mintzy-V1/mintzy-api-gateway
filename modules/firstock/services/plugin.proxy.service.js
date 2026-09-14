@@ -4,7 +4,7 @@ import AppError from "../utils/AppError.js";
 
 const PLUGIN_BASE = process.env.FIRSTOCK_PLUGIN_BASE_URL
     || process.env.PLUGIN_BASE_URL
-    || "http://34.56.133.232:8000";
+    || "http://34.205.29.123:8000";
 const PLUGIN_API_KEY = process.env.PLUGIN_API_KEY || "changeme-plugin-api-key";
 
 const resolvePluginTargetUrl = (tradingSession) => tradingSession?.vm_url || PLUGIN_BASE;

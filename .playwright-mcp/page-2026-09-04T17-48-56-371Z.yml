@@ -1,0 +1,19 @@
+- generic [ref=e3]:
+  - navigation [ref=e4]:
+    - img "Mintzy" [ref=e6]
+  - generic [ref=e8]:
+    - generic [ref=e9]:
+      - heading "Welcome back" [level=1] [ref=e10]
+      - paragraph [ref=e11]: Enter your API key to continue
+    - generic [ref=e12]:
+      - generic [ref=e13]:
+        - generic [ref=e14]: API Key
+        - generic [ref=e15]:
+          - textbox "API Key" [active] [ref=e16]:
+            - /placeholder: Paste your API key
+          - button "Show API key" [ref=e17]
+      - button "Continue" [ref=e21]
+    - paragraph [ref=e22]:
+      - text: Don't have an API key?
+      - link "Get one from your Mintzy account" [ref=e23] [cursor=pointer]:
+        - /url: https://mintzy.in

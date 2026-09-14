@@ -4,7 +4,7 @@ This guide creates the `modules/firstock` plugin module in `mintzy-api-gateway`,
 from the working `modules/bear_street` reference and adapted for the Firstock VM
 (`trader_hub_vm_repo`).
 
-**Firstock VM endpoint:** `http://34.56.133.232:8000` (same IP as before; override with
+**Firstock VM endpoint:** `http://34.205.29.123:8000` (same IP as before; override with
 `FIRSTOCK_PLUGIN_BASE_URL` in `.env` if it changes).
 
 The only functional difference from Bear Street is **authentication**: Firstock is
@@ -36,7 +36,7 @@ const PLUGIN_BASE = process.env.BEAR_STREET_PLUGIN_BASE_URL
 // AFTER
 const PLUGIN_BASE = process.env.FIRSTOCK_PLUGIN_BASE_URL
     || process.env.PLUGIN_BASE_URL
-    || "http://34.56.133.232:8000";
+    || "http://34.205.29.123:8000";
 ```
 
 Then `[BearStreet Proxy]` → `[Firstock Proxy]` (two occurrences: `success` and `failed`
@@ -236,7 +236,7 @@ startFirstockSimulationJobPoller();
 **`.env`** — add:
 
 ```env
-FIRSTOCK_PLUGIN_BASE_URL=http://34.56.133.232:8000
+FIRSTOCK_PLUGIN_BASE_URL=http://34.205.29.123:8000
 ```
 
 ---
@@ -267,7 +267,7 @@ FIRSTOCK_PLUGIN_BASE_URL=http://34.56.133.232:8000
 1. `node server.js` boots with `Firstock simulation poller started` in the logs.
 2. `POST /api/v1/firstock/credentials` with `{ userId, api_key, client_code, password, vendor_code }` → returns `requires_totp: true` + `session_id`.
 3. `POST /api/v1/firstock/totp` with `{ session_id, totp }` → session becomes `authenticated`.
-4. `GET /api/v1/firstock/health` → shows `pluginBase: http://34.56.133.232:8000`.
+4. `GET /api/v1/firstock/health` → shows `pluginBase: http://34.205.29.123:8000`.
 
 ## Gotchas
 
