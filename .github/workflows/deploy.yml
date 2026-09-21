@@ -45,7 +45,11 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            docker pull ${{ env.IMAGE }}:latest
-            docker rm -f mintzy-api-gateway || true
-            docker run -d --name mintzy-api-gateway -p 3000:3000 --env-file /home/admin/.env --restart unless-stopped ${{ env.IMAGE }}:latest
+          envs: GHCR_TOKEN
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull ${{ env.IMAGE }}:latest
+          docker rm -f mintzy-api-gateway || true
+          docker run -d --name mintzy-api-gateway -p 3000:3000 --env-file /home/admin/.env --restart unless-stopped ${{ env.IMAGE }}:latest
