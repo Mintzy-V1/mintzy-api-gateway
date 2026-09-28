@@ -154,6 +154,187 @@ const failClosedStopSimulation = async (session, err) => {
     };
 };
 
+const PLUGIN_REACHABILITY_TIMEOUT_MS = parseInt(process.env.PLUGIN_REACHABILITY_TIMEOUT_MS || "5000", 10);
+
+const isHttpReachableStatus = (status) => Number(status) >= 200 && Number(status) < 500;
+
+const isPluginVmReachable = async (userId, session) => {
+    const sessionId = session?.python_session_id;
+    const targetBaseUrl = resolvePluginTargetUrl(session);
+    if (!sessionId || !targetBaseUrl) {
+        return false;
+    }
+
+    const probe = async (path) => {
+        const res = await forwardToPlugin(
+            path,
+            "get",
+            null,
+            userId ? { "X-Forwarded-User": userId.toString() } : {},
+            {},
+            { timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS, retries: 1, failOnError: false, targetBaseUrl }
+        );
+        return isHttpReachableStatus(res?.status);
+    };
+
+    try {
+        if (await probe(`/api/trading/live-pnl/${sessionId}`)) {
+            return true;
+        }
+    } catch (_) {
+        // try next probe
+    }
+
+    try {
+        if (await probe(`/api/session/${sessionId}/status`)) {
+            return true;
+        }
+    } catch (_) {
+        // try next probe
+    }
+
+    try {
+        if (await probe("/api/health")) {
+            return true;
+        }
+    } catch (_) {
+        // VM did not answer GET
+    }
+
+    return false;
+};
+
+const releaseHandoffLockForRetry = async (session, err) => {
+    await TradingSession.findByIdAndUpdate(session._id, {
+        $set: {
+            simulation_status: "running",
+            simulation_live_switch_triggered: false,
+            "simulation_output.skip_live": true,
+            "simulation_output.stop_retry_pending": true,
+            "simulation_output.last_stop_error": err?.message || "stop-simulation fetch failed"
+        }
+    }).catch(() => {});
+
+    logger.warn("Stop-simulation POST failed but plugin VM is still reachable — releasing handoff lock for retry (live will not start)", {
+        sessionId: session.python_session_id,
+        userId: session.user_id?.toString(),
+        error: err?.message
+    });
+};
+
+const shouldSkipLiveStart = (session) => Boolean(session?.simulation_output?.skip_live);
+
+const finalizeStoppedWithoutLive = async (session, stopResponse, extraOutput = {}) => {
+    const stoppedAt = new Date();
+    await TradingSession.findByIdAndUpdate(session._id, {
+        $set: {
+            status: "stopped",
+            simulation_status: "completed",
+            simulation_completed_at: stoppedAt,
+            simulation_live_switch_triggered: false,
+            ended_at: stoppedAt,
+            simulation_output: {
+                stop: stopResponse || session.simulation_output?.stop || null,
+                skip_live: true,
+                live_allowed: false,
+                ...extraOutput
+            }
+        }
+    });
+
+    dataService.stopLivePnlSnapshotMonitor(session.python_session_id, session.user_id);
+
+    logger.warn("Simulation stopped without starting live trading", {
+        sessionId: session.python_session_id,
+        reason: extraOutput.reason || "skip_live"
+    });
+
+    return {
+        session_id: session.python_session_id,
+        configuration_id: session.saved_configuration_id?.toString?.() || null,
+        saved_configuration_id: session.saved_configuration_id?.toString?.() || null,
+        stop: stopResponse,
+        live_trading: null,
+        status: "stopped",
+        live_allowed: false,
+        message: extraOutput.message || "Simulation stopped. Live trading was not started."
+    };
+};
+
+const handleHandoffStopFailure = async (userId, session, err) => {
+    const latestSession = await TradingSession.findById(session._id).lean();
+    if (isSimulationCancellationRequested(latestSession)) {
+        return {
+            type: "cancelled",
+            response: buildSimulationCancelledResponse(session.python_session_id, latestSession)
+        };
+    }
+
+    if (!isStopSimulationVmUnavailableError(err)) {
+        session.simulation_live_switch_triggered = false;
+        session.simulation_status = "handoff_failed";
+        await session.save().catch(() => {});
+        throw err;
+    }
+
+    const reachable = await isPluginVmReachable(userId, session);
+    if (!reachable) {
+        return {
+            type: "fail_closed",
+            response: await failClosedStopSimulation(session, err)
+        };
+    }
+
+    logger.warn("Stop-simulation POST failed but plugin GET still works — retrying stop only; live will not start", {
+        sessionId: session.python_session_id,
+        userId: userId?.toString(),
+        error: err?.message
+    });
+
+    try {
+        const stopResponse = await stopSimulationTrading(userId, session.python_session_id);
+        const noLiveResult = await finalizeStoppedWithoutLive(session, stopResponse, {
+            reason: "stop_retried_after_transient_failure",
+            stop_retried_after_transient_failure: true,
+            message: "Simulation stopped after retry. Live trading was not started because the first stop-simulation POST failed."
+        });
+        return {
+            type: "handoff",
+            handoffResult: {
+                stopResponse,
+                liveStartResult: null,
+                noLiveResult
+            }
+        };
+    } catch (retryErr) {
+        const latestAfterRetry = await TradingSession.findById(session._id).lean();
+        if (isSimulationCancellationRequested(latestAfterRetry)) {
+            return {
+                type: "cancelled",
+                response: buildSimulationCancelledResponse(session.python_session_id, latestAfterRetry)
+            };
+        }
+
+        if (isStopSimulationVmUnavailableError(retryErr)) {
+            const stillReachable = await isPluginVmReachable(userId, session);
+            if (!stillReachable) {
+                return {
+                    type: "fail_closed",
+                    response: await failClosedStopSimulation(session, retryErr)
+                };
+            }
+
+            await releaseHandoffLockForRetry(session, retryErr);
+            throw retryErr;
+        }
+
+        session.simulation_live_switch_triggered = false;
+        session.simulation_status = "handoff_failed";
+        await session.save().catch(() => {});
+        throw retryErr;
+    }
+};
+
 const getIstDateParts = (date = new Date()) => {
     const clock = getIstClockParts(date);
     return {
@@ -771,19 +952,11 @@ const applySimulationOutputAndStartLive = async (session, jobResult = null) => {
     try {
         handoffResult = await executeSimulationToLiveHandoff(userId, session);
     } catch (err) {
-        const latestSession = await TradingSession.findById(session._id).lean();
-        if (isSimulationCancellationRequested(latestSession)) {
-            return buildSimulationCancelledResponse(session.python_session_id, latestSession);
+        const handled = await handleHandoffStopFailure(userId, session, err);
+        if (handled.type === "cancelled" || handled.type === "fail_closed") {
+            return handled.response;
         }
-
-        if (isStopSimulationVmUnavailableError(err)) {
-            return failClosedStopSimulation(session, err);
-        }
-
-        session.simulation_live_switch_triggered = false;
-        session.simulation_status = "handoff_failed";
-        await session.save().catch(() => {});
-        throw err;
+        handoffResult = handled.handoffResult;
     }
 
     if (handoffResult.noLiveResult) {
@@ -1129,6 +1302,14 @@ const runScheduledLiveStart = async (userId, sessionId) => {
         return;
     }
 
+    if (shouldSkipLiveStart(session)) {
+        await finalizeStoppedWithoutLive(session, stopResponse, {
+            reason: "skip_live_after_stop_transport_failure",
+            message: "Simulation stopped. Live trading was not started after a stop-simulation transport failure."
+        });
+        return;
+    }
+
     if (!isLiveStartWindowOpen()) {
         scheduleLiveStartTimer(userId, session, stopResponse);
         return;
@@ -1278,6 +1459,18 @@ const recoverPendingLiveStartTimers = async () => {
 const scheduleLiveStartAfterStop = async (userId, session, stopResponse) => {
     const session_id = session.python_session_id;
 
+    if (shouldSkipLiveStart(session)) {
+        const noLiveResult = await finalizeStoppedWithoutLive(session, stopResponse, {
+            reason: "skip_live_after_stop_transport_failure",
+            message: "Simulation stopped. Live trading was not started after a stop-simulation transport failure."
+        });
+        return {
+            liveStartResult: null,
+            noLive: true,
+            noLiveResult
+        };
+    }
+
     if (!isLiveStartWindowOpen()) {
         const pendingSession = await persistLiveStartPending(session, stopResponse);
         scheduleLiveStartTimer(userId, pendingSession || session, stopResponse);
@@ -1350,6 +1543,20 @@ const resolveLiveHandoffAfterStopComplete = async (userId, session, stopResponse
         };
     }
 
+    const latestForSkipLive = await TradingSession.findById(session._id).lean();
+    if (shouldSkipLiveStart(session) || shouldSkipLiveStart(latestForSkipLive)) {
+        logSimGwTiming("stop poll complete — skip live after stop transport failure", { session_id });
+        const noLiveResult = await finalizeStoppedWithoutLive(latestForSkipLive || session, stopResponse, {
+            reason: "skip_live_after_stop_transport_failure",
+            message: "Simulation stopped. Live trading was not started after a stop-simulation transport failure."
+        });
+        return {
+            stopResponse,
+            liveStartResult: null,
+            noLiveResult
+        };
+    }
+
     logSimGwTiming("stop poll complete — evaluating live start", {
         session_id,
         trading_status: stopResponse?.trading_status ?? null,
@@ -1388,6 +1595,14 @@ const resolveLiveHandoffAfterStopComplete = async (userId, session, stopResponse
             stopResponse,
             liveStartResult: liveStartOutcome.liveStartResult || null,
             alreadyLive: true
+        };
+    }
+
+    if (liveStartOutcome.noLive) {
+        return {
+            stopResponse,
+            liveStartResult: null,
+            noLiveResult: liveStartOutcome.noLiveResult
         };
     }
 
@@ -1680,19 +1895,11 @@ const stopSimulation = async (userId, payload = {}) => {
     try {
         handoffResult = await executeSimulationToLiveHandoff(userId, session);
     } catch (err) {
-        const latestSession = await TradingSession.findById(session._id).lean();
-        if (isSimulationCancellationRequested(latestSession)) {
-            return buildSimulationCancelledResponse(session_id, latestSession);
+        const handled = await handleHandoffStopFailure(userId, session, err);
+        if (handled.type === "cancelled" || handled.type === "fail_closed") {
+            return handled.response;
         }
-
-        if (isStopSimulationVmUnavailableError(err)) {
-            return failClosedStopSimulation(session, err);
-        }
-
-        session.simulation_live_switch_triggered = false;
-        session.simulation_status = "handoff_failed";
-        await session.save().catch(() => {});
-        throw err;
+        handoffResult = handled.handoffResult;
     }
 
     if (handoffResult.noLiveResult) {

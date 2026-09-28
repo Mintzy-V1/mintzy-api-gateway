@@ -24,7 +24,11 @@ const SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS = parseInt(
     process.env.SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS || "15000",
     10
 );
-const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "10000", 10);
+const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "2000", 10);
+const SIMULATION_STOP_POST_RETRIES = Math.max(
+    1,
+    parseInt(process.env.SIMULATION_STOP_POST_RETRIES || "3", 10)
+);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -57,7 +61,7 @@ const invokeStopSimulationPlugin = async (userId, sessionId, targetBaseUrl, stop
         {},
         { "X-Forwarded-User": userId.toString() },
         {},
-        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: 0 }
+        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: SIMULATION_STOP_POST_RETRIES }
     );
 
     if (!pluginRes?.data || typeof pluginRes.data !== "object") {
