@@ -21,7 +21,11 @@ const SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS = parseInt(
     process.env.SIMULATION_STOP_STATUS_REQUEST_TIMEOUT_MS || "15000",
     10
 );
-const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "10000", 10);
+const SIMULATION_STOP_RETRY_DELAY_MS = parseInt(process.env.SIMULATION_STOP_RETRY_DELAY_MS || "2000", 10);
+const SIMULATION_STOP_POST_RETRIES = Math.max(
+    1,
+    parseInt(process.env.SIMULATION_STOP_POST_RETRIES || "3", 10)
+);
 const AUTO_AUTH_PLUGIN_BASE_URL = process.env.BEAR_STREET_PLUGIN_AUTO_AUTH_BASE_URL
     || process.env.PLUGIN_AUTO_AUTH_BASE_URL
     || null;
@@ -51,14 +55,37 @@ const isTransientStopSimulationFailure = (err) => {
     );
 };
 
+const summarizePluginError = (err) => ({
+    message: err?.message || null,
+    name: err?.name || null,
+    statusCode: err?.statusCode || err?.response?.status || null,
+    details: err?.details || err?.response?.data || null,
+    causeCode: err?.cause?.code || err?.details?.causeCode || null,
+    causeMessage: err?.cause?.message || err?.details?.causeMessage || null,
+    errorName: err?.details?.errorName || err?.name || null,
+    targetUrl: err?.details?.targetUrl || null,
+    timeoutMs: err?.details?.timeoutMs || null,
+    durationMs: err?.details?.durationMs || null,
+    hostname: err?.details?.hostname || null,
+    port: err?.details?.port || null,
+    attempt: err?.details?.attempt || null
+});
+
 const invokeStopSimulationPlugin = async (userId, sessionId, targetBaseUrl, stopRequestTimeoutMs) => {
+    logger.info("[STOP-DIAG] stop-simulation POST start", {
+        sessionId,
+        userId: userId?.toString(),
+        targetBaseUrl,
+        timeoutMs: stopRequestTimeoutMs,
+        retries: SIMULATION_STOP_POST_RETRIES
+    });
     const pluginRes = await forwardToPlugin(
         `/api/trading/stop-simulation/${sessionId}`,
         "post",
         {},
         { "X-Forwarded-User": userId.toString() },
         {},
-        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: 0 }
+        { targetBaseUrl, timeoutMs: stopRequestTimeoutMs, retries: SIMULATION_STOP_POST_RETRIES }
     );
 
     if (!pluginRes?.data || typeof pluginRes.data !== "object") {
@@ -646,9 +673,30 @@ const stopSimulationTrading = async (userId, sessionId, options = {}) => {
         );
     } catch (firstErr) {
         const recovered = await tryRecoverStopSimulationFromStatus(userId, sessionId, targetBaseUrl);
+        const transient = isTransientStopSimulationFailure(firstErr);
+        logger.warn("[STOP-DIAG] stopSimulationTrading first POST failed", {
+            sessionId,
+            userId: userId?.toString(),
+            targetBaseUrl,
+            stopPostTimeoutMs,
+            stopPostRetries: SIMULATION_STOP_POST_RETRIES,
+            recovered: Boolean(recovered),
+            transient,
+            next: recovered
+                ? "use_status_recovery"
+                : (transient ? "poll_then_retry_POST" : "throw"),
+            ...summarizePluginError(firstErr)
+        });
+        console.log("[STOP-DIAG] stopSimulationTrading first POST failed", {
+            sessionId,
+            targetBaseUrl,
+            recovered: Boolean(recovered),
+            transient,
+            ...summarizePluginError(firstErr)
+        });
         if (recovered) {
             stopResponse = recovered;
-        } else if (!isTransientStopSimulationFailure(firstErr)) {
+        } else if (!transient) {
             throw firstErr;
         } else {
             console.log("[SIM-HANDOFF-DEBUG] stopSimulationTrading transient failure — poll then retry POST", {
@@ -656,7 +704,9 @@ const stopSimulationTrading = async (userId, sessionId, options = {}) => {
                 attempt: 1,
                 error: firstErr.message,
                 statusCode: firstErr.statusCode || firstErr.response?.status || null,
-                retryDelayMs: SIMULATION_STOP_RETRY_DELAY_MS
+                retryDelayMs: SIMULATION_STOP_RETRY_DELAY_MS,
+                details: firstErr.details || null,
+                causeCode: firstErr.details?.causeCode || firstErr.cause?.code || null
             });
 
             await sleep(SIMULATION_STOP_RETRY_DELAY_MS);

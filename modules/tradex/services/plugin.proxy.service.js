@@ -63,13 +63,33 @@ const parseResponseBody = async (response) => {
     }
 };
 
+const parsePluginTarget = (url) => {
+    try {
+        const parsed = new URL(url);
+        return {
+            hostname: parsed.hostname || null,
+            port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
+            protocol: parsed.protocol || null
+        };
+    } catch {
+        return { hostname: null, port: null, protocol: null };
+    }
+};
+
 const getFetchFailureDetails = (err) => ({
-    causeCode: err.cause?.code,
-    causeMessage: err.cause?.message,
-    causeName: err.cause?.name,
-    errorName: err.name,
-    errorMessage: err.message
+    causeCode: err.cause?.code || err.code || null,
+    causeErrno: err.cause?.errno || null,
+    causeSyscall: err.cause?.syscall || null,
+    causeAddress: err.cause?.address || null,
+    causePort: err.cause?.port || null,
+    causeMessage: err.cause?.message || null,
+    causeName: err.cause?.name || null,
+    errorName: err.name || null,
+    errorMessage: err.message || null
 });
+
+const shouldStopDiag = (path, options) =>
+    String(path || "").includes("stop-simulation") || options?.failOnError === false;
 
 async function forwardToPlugin(path, method = "post", data = {}, headers = {}, params = {}, options = {}) {
     const base = options.targetBaseUrl || PLUGIN_BASE;
@@ -121,27 +141,63 @@ async function forwardToPlugin(path, method = "post", data = {}, headers = {}, p
                 throw error;
             }
 
+            const durationMs = Date.now() - start;
             logger.info(`[TradeX Proxy] ${method.toUpperCase()} ${path} success`, {
-                duration: Date.now() - start,
+                duration: durationMs,
                 attempt,
                 status: normalizedResponse.status
             });
+            if (shouldStopDiag(path, options)) {
+                logger.info("[STOP-DIAG] plugin request ok", {
+                    method: method.toUpperCase(),
+                    path,
+                    url,
+                    ...parsePluginTarget(url),
+                    attempt,
+                    maxRetries,
+                    timeoutMs,
+                    durationMs,
+                    status: normalizedResponse.status
+                });
+            }
 
             return normalizedResponse;
         } catch (err) {
             const isClientError = err.response?.status >= 400 && err.response?.status < 500;
+            const durationMs = Date.now() - start;
+            const fetchFailure = getFetchFailureDetails(err);
+            const target = parsePluginTarget(url);
+            const willRetry = attempt < maxRetries && !isClientError;
 
             logger.warn(`[TradeX Proxy] ${method.toUpperCase()} ${path} failed`, {
                 url,
-                duration: Date.now() - start,
+                duration: durationMs,
                 attempt,
+                timeoutMs,
+                maxRetries,
                 error: err.message,
                 status: err.response?.status,
                 details: err.response?.data,
-                fetchFailure: getFetchFailureDetails(err)
+                fetchFailure
             });
+            if (shouldStopDiag(path, options)) {
+                logger.warn("[STOP-DIAG] plugin request failed", {
+                    method: method.toUpperCase(),
+                    path,
+                    url,
+                    ...target,
+                    attempt,
+                    maxRetries,
+                    timeoutMs,
+                    durationMs,
+                    failOnError,
+                    willRetry,
+                    status: err.response?.status || null,
+                    ...fetchFailure
+                });
+            }
 
-            if (attempt < maxRetries && !isClientError) {
+            if (willRetry) {
                 await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
                 continue;
             }
@@ -150,9 +206,15 @@ async function forwardToPlugin(path, method = "post", data = {}, headers = {}, p
                 const statusCode = err.response?.status || 502;
                 const customErr = new AppError(`Plugin request failed at ${path}: ${err.message}`, statusCode);
                 customErr.response = err.response;
-                customErr.details = err.response?.data || {
+                customErr.details = {
                     targetUrl: url,
-                    ...getFetchFailureDetails(err)
+                    timeoutMs,
+                    attempt,
+                    maxRetries,
+                    durationMs,
+                    ...target,
+                    ...fetchFailure,
+                    pluginBody: err.response?.data ?? null
                 };
                 throw customErr;
             }

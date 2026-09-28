@@ -563,7 +563,7 @@ const downloadFinalTradebook = catchAsync(async (req, res) => {
     const { sessionId } = req.params;
 
     const ts = await TradingSession.findOne({ python_session_id: sessionId });
-    const targetBaseUrl = ts?.vm_url;
+    const targetBaseUrl = proxyService.resolvePluginTargetUrl(ts);
 
     const pluginRes = await proxyService.forwardToPlugin(
         `/api/trading/${sessionId}/final-tradebook`,
