@@ -61,6 +61,7 @@ const getTargetBaseUrlByApiKey = (apiKey) => {
 };
 
 const resolvePluginTargetUrl = (tradingSession, apiKey) => {
+    // First choice is always the session's own plugin VM from login/start-simulation.
     const stored = tradingSession?.vm_url;
     if (stored && !isForbiddenFallbackUrl(stored)) {
         return stored.replace(/\/$/, "");
