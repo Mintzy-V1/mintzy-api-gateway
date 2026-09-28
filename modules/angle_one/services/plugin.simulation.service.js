@@ -12,7 +12,6 @@ import logger from "../config/logger.js";
 
 const DATE_TIMEZONE = "Asia/Kolkata";
 
-const SIMULATION_BASE_URL = (process.env.SIMULATION_BASE_URL || "http://18.205.165.28:8000").replace(/\/$/, "");
 const SIMULATION_START_PATH = process.env.SIMULATION_START_PATH || "/api/trading/start-simulation";
 const SIMULATION_JOB_STATUS_PATH = process.env.SIMULATION_JOB_STATUS_PATH || "/start-simulation/:jobId";
 const SIMULATION_STOP_PATH = process.env.SIMULATION_STOP_PATH || "/stop";
@@ -566,10 +565,29 @@ const formatSimulationErrorDetail = (data) => {
     return null;
 };
 
-const callSimulationService = async (method, path, body = null, headers = {}, baseUrl = SIMULATION_BASE_URL) => {
-    const resolvedBaseUrl = (baseUrl || SIMULATION_BASE_URL || "").replace(/\/$/, "");
+const isDeadSharedSimulationHost = (url) => {
+    const value = String(url || "").toLowerCase();
+    return value.includes("plugin.mintzy.in") || value.includes("18.205.165.28");
+};
+
+const resolveSimulationJobHost = (session) => {
+    const targetBaseUrl = resolvePluginTargetUrl(session);
+    if (!targetBaseUrl) {
+        throw new AppError("Plugin VM URL is missing for this simulation job", 502);
+    }
+    if (isDeadSharedSimulationHost(targetBaseUrl)) {
+        throw new AppError("Refusing plugin.mintzy.in / 18.205 for simulation job request", 502);
+    }
+    return targetBaseUrl;
+};
+
+const callSimulationService = async (method, path, body = null, headers = {}, baseUrl) => {
+    const resolvedBaseUrl = String(baseUrl || "").replace(/\/$/, "");
     if (!resolvedBaseUrl) {
-        throw new AppError("Simulation service is not configured (SIMULATION_BASE_URL)", 503);
+        throw new AppError("Simulation job host is missing for this session", 503);
+    }
+    if (isDeadSharedSimulationHost(resolvedBaseUrl)) {
+        throw new AppError("Refusing plugin.mintzy.in / 18.205 for simulation job request", 502);
     }
 
     const url = `${resolvedBaseUrl}${path.startsWith("/") ? path : `/${path}`}`;
@@ -1140,18 +1158,36 @@ const triggerLiveHandoffInBackground = (sessionId) => {
 };
 */
 
-const fetchSimulationJobStatus = async (jobId) =>
-    callSimulationService("get", buildSimulationJobStatusPath(jobId));
+const fetchSimulationJobStatus = async (session) => {
+    const jobId = session.simulation_job_id;
+    const baseUrl = resolveSimulationJobHost(session);
+    logger.info("[STOP-DIAG] simulation job status request", {
+        sessionId: session.python_session_id,
+        jobId,
+        vm_url: session.vm_url || null,
+        targetBaseUrl: baseUrl
+    });
+    return callSimulationService("get", buildSimulationJobStatusPath(jobId), null, {}, baseUrl);
+};
 
-const stopSimulationJob = async (jobId, userId) => {
+const stopSimulationJob = async (session, userId) => {
+    const jobId = session.simulation_job_id;
+    const baseUrl = resolveSimulationJobHost(session);
     const path = buildSimulationStopPath(jobId);
     const body = { job_id: jobId, userId: userId.toString() };
 
+    logger.info("[STOP-DIAG] simulation job stop request", {
+        sessionId: session.python_session_id,
+        jobId,
+        vm_url: session.vm_url || null,
+        targetBaseUrl: baseUrl
+    });
+
     if (SIMULATION_STOP_METHOD === "GET") {
-        return callSimulationService("get", path);
+        return callSimulationService("get", path, null, {}, baseUrl);
     }
 
-    return callSimulationService(SIMULATION_STOP_METHOD, path, body);
+    return callSimulationService(SIMULATION_STOP_METHOD, path, body, {}, baseUrl);
 };
 
 const updateSavedConfigurationStrategyForLive = async (savedConfigurationId) => {
@@ -2114,7 +2150,7 @@ const processSimulationSession = async (session) => {
         await session.save();
     }
 
-    const jobResult = await fetchSimulationJobStatus(session.simulation_job_id);
+    const jobResult = await fetchSimulationJobStatus(session);
     const externalStatus = String(jobResult?.status || "").toLowerCase();
 
     if (externalStatus === "failed") {
@@ -2173,7 +2209,6 @@ const processSimulationSession = async (session) => {
 };
 
 const pollDueSimulationJobs = async () => {
-    if (!SIMULATION_BASE_URL) return;
     if (!isSimulationPollWindowOpen()) return;
     if (pollInProgress) return;
 
@@ -2181,7 +2216,7 @@ const pollDueSimulationJobs = async () => {
 
     console.log("[SIM-POLLER-DEBUG] pollDueSimulationJobs tick", {
         at: new Date().toISOString(),
-        simulationBaseUrl: SIMULATION_BASE_URL
+        jobHost: "per-session vm_url"
     });
 
     try {
@@ -2196,7 +2231,12 @@ const pollDueSimulationJobs = async () => {
 
         console.log("[SIM-POLLER-DEBUG] pollDueSimulationJobs sessions found", {
             count: sessions.length,
-            sessionIds: sessions.map((s) => s.python_session_id)
+            sessions: sessions.map((s) => ({
+                sessionId: s.python_session_id,
+                jobId: s.simulation_job_id,
+                vm_url: s.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(s)
+            }))
         });
 
         for (const session of sessions) {
@@ -2204,7 +2244,9 @@ const pollDueSimulationJobs = async () => {
                 console.log("[SIM-POLLER-DEBUG] processing session", {
                     sessionId: session.python_session_id,
                     jobId: session.simulation_job_id,
-                    simulation_status: session.simulation_status
+                    simulation_status: session.simulation_status,
+                    vm_url: session.vm_url || null,
+                    resolvedTargetUrl: resolvePluginTargetUrl(session)
                 });
                 await processSimulationSession(session);
             } catch (err) {
@@ -2359,9 +2401,9 @@ const getSimulationStatus = async (userId, sessionId) => {
         saved_configuration_id: session.saved_configuration_id || null
     };
 
-    if (session.simulation_job_id && SIMULATION_BASE_URL) {
+    if (session.simulation_job_id) {
         try {
-            response.external_job = await fetchSimulationJobStatus(session.simulation_job_id);
+            response.external_job = await fetchSimulationJobStatus(session);
         } catch (err) {
             response.external_job_error = err.message;
         }
@@ -2385,7 +2427,7 @@ const startSimulationJobPoller = () => {
             hour: process.env.SIMULATION_AUTO_STOP_HOUR_IST ?? "(default)",
             minute: process.env.SIMULATION_AUTO_STOP_MINUTE_IST ?? "(default)"
         },
-        simulationBaseUrl: SIMULATION_BASE_URL
+        jobHost: "per-session vm_url"
     });
 
     recoverPendingLiveStartTimers().catch((err) => {
@@ -2415,7 +2457,7 @@ const startSimulationJobPoller = () => {
         liveStartPollMs: SIMULATION_LIVE_START_POLL_MS,
         liveStartAtIst: getLiveStartWindowIstLabel(),
         pollStartIst: `${SIMULATION_POLL_START_HOUR_IST}:${String(SIMULATION_POLL_START_MINUTE_IST).padStart(2, "0")}`,
-        simulationBaseUrl: SIMULATION_BASE_URL || "(not configured)"
+        jobHost: "per-session vm_url"
     });
 };
 
