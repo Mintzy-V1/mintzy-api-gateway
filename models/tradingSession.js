@@ -6,6 +6,7 @@ const tradingSessionSchema = new mongoose.Schema({
   broker: { type: String, enum: ['angle_one', 'tradex', 'bear_street', 'firstock'], index: true },
   status: { type: String, default: 'created' },
   vm_url: { type: String },
+  plugin_api_key: { type: String },
   auto_auth_on_credentials: { type: Boolean, default: false },
   credentials_fingerprint: { type: String },
   saved_configuration_id: { type: mongoose.Schema.Types.ObjectId, ref: 'SavedTradingConfiguration' },

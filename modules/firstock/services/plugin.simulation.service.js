@@ -93,6 +93,21 @@ const isStopSimulationVmUnavailableError = (err) => {
     );
 };
 
+const summarizeStopError = (err) => ({
+    message: err?.message || null,
+    statusCode: getStopSimulationFailureStatusCode(err),
+    details: err?.details || err?.response?.data || null,
+    causeCode: err?.cause?.code || err?.details?.causeCode || null,
+    causeMessage: err?.cause?.message || err?.details?.causeMessage || null,
+    errorName: err?.name || err?.details?.errorName || null,
+    targetUrl: err?.details?.targetUrl || null,
+    timeoutMs: err?.details?.timeoutMs || null,
+    durationMs: err?.details?.durationMs || null,
+    hostname: err?.details?.hostname || null,
+    port: err?.details?.port || null,
+    attempt: err?.details?.attempt || null
+});
+
 const failClosedStopSimulation = async (session, err) => {
     const stoppedAt = new Date();
     const sessionId = session.python_session_id;
@@ -135,8 +150,18 @@ const failClosedStopSimulation = async (session, err) => {
     logger.error("Stop-simulation failed closed because plugin VM was unavailable", {
         sessionId,
         userId: session.user_id?.toString(),
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
         statusCode,
-        error: err?.message
+        ...summarizeStopError(err)
+    });
+    logger.error("[STOP-DIAG] fail-closed stop-simulation", {
+        sessionId,
+        userId: session.user_id?.toString(),
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
+        next: "skip_live_mark_stopped",
+        ...summarizeStopError(err)
     });
 
     return {
@@ -162,19 +187,52 @@ const isPluginVmReachable = async (userId, session) => {
     const sessionId = session?.python_session_id;
     const targetBaseUrl = resolvePluginTargetUrl(session);
     if (!sessionId || !targetBaseUrl) {
+        logger.warn("[STOP-DIAG] VM reachability skipped — missing sessionId or target", {
+            sessionId: sessionId || null,
+            userId: userId?.toString(),
+            vm_url: session?.vm_url || null,
+            targetBaseUrl: targetBaseUrl || null
+        });
         return false;
     }
 
     const probe = async (path) => {
-        const res = await forwardToPlugin(
-            path,
-            "get",
-            null,
-            userId ? { "X-Forwarded-User": userId.toString() } : {},
-            {},
-            { timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS, retries: 1, failOnError: false, targetBaseUrl }
-        );
-        return isHttpReachableStatus(res?.status);
+        const startedMs = Date.now();
+        try {
+            const res = await forwardToPlugin(
+                path,
+                "get",
+                null,
+                userId ? { "X-Forwarded-User": userId.toString() } : {},
+                {},
+                { timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS, retries: 1, failOnError: false, targetBaseUrl }
+            );
+            const reachable = isHttpReachableStatus(res?.status);
+            logger.warn("[STOP-DIAG] VM reachability probe", {
+                sessionId,
+                userId: userId?.toString(),
+                targetBaseUrl,
+                path,
+                reachable,
+                httpStatus: res?.status ?? null,
+                durationMs: Date.now() - startedMs,
+                timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS
+            });
+            return reachable;
+        } catch (probeErr) {
+            logger.warn("[STOP-DIAG] VM reachability probe threw", {
+                sessionId,
+                userId: userId?.toString(),
+                targetBaseUrl,
+                path,
+                reachable: false,
+                durationMs: Date.now() - startedMs,
+                timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS,
+                error: probeErr?.message || null,
+                details: probeErr?.details || null
+            });
+            return false;
+        }
     };
 
     try {
@@ -201,6 +259,13 @@ const isPluginVmReachable = async (userId, session) => {
         // VM did not answer GET
     }
 
+    logger.warn("[STOP-DIAG] plugin VM not reachable after all GET probes", {
+        sessionId,
+        userId: userId?.toString(),
+        targetBaseUrl,
+        vm_url: session?.vm_url || null,
+        timeoutMs: PLUGIN_REACHABILITY_TIMEOUT_MS
+    });
     return false;
 };
 
@@ -218,7 +283,18 @@ const releaseHandoffLockForRetry = async (session, err) => {
     logger.warn("Stop-simulation POST failed but plugin VM is still reachable — releasing handoff lock for retry (live will not start)", {
         sessionId: session.python_session_id,
         userId: session.user_id?.toString(),
-        error: err?.message
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
+        error: err?.message,
+        ...summarizeStopError(err)
+    });
+    logger.warn("[STOP-DIAG] releasing handoff lock for retry — live will not start", {
+        sessionId: session.python_session_id,
+        userId: session.user_id?.toString(),
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
+        next: "skip_live_retry_later",
+        ...summarizeStopError(err)
     });
 };
 
@@ -271,13 +347,37 @@ const handleHandoffStopFailure = async (userId, session, err) => {
     }
 
     if (!isStopSimulationVmUnavailableError(err)) {
+        logger.warn("[STOP-DIAG] handleHandoffStopFailure not classified as VM unavailable — rethrowing", {
+            sessionId: session.python_session_id,
+            userId: userId?.toString(),
+            vm_url: session.vm_url || null,
+            resolvedTargetUrl: resolvePluginTargetUrl(session),
+            ...summarizeStopError(err)
+        });
         session.simulation_live_switch_triggered = false;
         session.simulation_status = "handoff_failed";
         await session.save().catch(() => {});
         throw err;
     }
 
+    logger.warn("[STOP-DIAG] handleHandoffStopFailure entered", {
+        sessionId: session.python_session_id,
+        userId: userId?.toString(),
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
+        classifiedVmUnavailable: true,
+        ...summarizeStopError(err)
+    });
+
     const reachable = await isPluginVmReachable(userId, session);
+    logger.warn("[STOP-DIAG] handoff reachability result", {
+        sessionId: session.python_session_id,
+        userId: userId?.toString(),
+        vm_url: session.vm_url || null,
+        resolvedTargetUrl: resolvePluginTargetUrl(session),
+        reachable,
+        next: reachable ? "retry_stop_skip_live" : "fail_closed"
+    });
     if (!reachable) {
         return {
             type: "fail_closed",
@@ -317,6 +417,15 @@ const handleHandoffStopFailure = async (userId, session, err) => {
 
         if (isStopSimulationVmUnavailableError(retryErr)) {
             const stillReachable = await isPluginVmReachable(userId, session);
+            logger.warn("[STOP-DIAG] handoff retry still reachable?", {
+                sessionId: session.python_session_id,
+                userId: userId?.toString(),
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session),
+                stillReachable,
+                next: stillReachable ? "release_lock_skip_live" : "fail_closed",
+                ...summarizeStopError(retryErr)
+            });
             if (!stillReachable) {
                 return {
                     type: "fail_closed",
@@ -2127,7 +2236,12 @@ const autoStopDueSimulations = async () => {
         tradeDate: today,
         stopAtIst: `${SIMULATION_AUTO_STOP_HOUR_IST}:${String(SIMULATION_AUTO_STOP_MINUTE_IST).padStart(2, "0")}`,
         sessionCount: sessions.length,
-        sessionIds: sessions.map((s) => s.python_session_id)
+        sessionIds: sessions.map((s) => s.python_session_id),
+        sessions: sessions.map((s) => ({
+            sessionId: s.python_session_id,
+            vm_url: s.vm_url || null,
+            resolvedTargetUrl: resolvePluginTargetUrl(s)
+        }))
     });
 
     if (sessions.length === 0) {
@@ -2148,7 +2262,15 @@ const autoStopDueSimulations = async () => {
         try {
             console.log("[SIM-POLLER-DEBUG] autoStop calling stopSimulation", {
                 sessionId: session.python_session_id,
-                userId: session.user_id?.toString()
+                userId: session.user_id?.toString(),
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session)
+            });
+            logger.warn("[STOP-DIAG] autoStop calling stopSimulation", {
+                sessionId: session.python_session_id,
+                userId: session.user_id?.toString(),
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session)
             });
             await stopSimulation(session.user_id, { session_id: session.python_session_id });
             console.log("[SIM-POLLER-DEBUG] autoStop stopSimulation SUCCESS", {
@@ -2161,13 +2283,26 @@ const autoStopDueSimulations = async () => {
         } catch (err) {
             console.log("[SIM-POLLER-DEBUG] autoStop stopSimulation FAILED", {
                 sessionId: session.python_session_id,
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session),
                 error: err.message,
+                details: err.details || null,
                 stack: err.stack
             });
             logger.warn("Simulation auto-stop failed for session", {
                 sessionId: session.python_session_id,
                 userId: session.user_id?.toString(),
-                error: err.message
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session),
+                error: err.message,
+                ...summarizeStopError(err)
+            });
+            logger.warn("[STOP-DIAG] autoStop stopSimulation FAILED", {
+                sessionId: session.python_session_id,
+                userId: session.user_id?.toString(),
+                vm_url: session.vm_url || null,
+                resolvedTargetUrl: resolvePluginTargetUrl(session),
+                ...summarizeStopError(err)
             });
         }
     };
